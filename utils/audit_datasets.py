@@ -222,11 +222,14 @@ def audit_tff_sqlite(root: Path, dataset: str, filename: str, display: str) -> A
             total_samples = 0
             all_client_ids: set[str] = set()
             split_parts: list[str] = []
+            split_counts: dict[str, int] = {}
+            split_client_counts: dict[str, int] = {}
             for split, count, distinct_clients in example_rows:
                 split = str(split)
                 count = int(count)
                 distinct_clients = int(distinct_clients)
-                total_samples += count
+                split_counts[split] = count
+                split_client_counts[split] = distinct_clients
                 if split not in meta_by_split:
                     raise AuditError(f"metadata missing split {split!r}")
                 meta_clients, meta_examples = meta_by_split[split]
@@ -246,6 +249,17 @@ def audit_tff_sqlite(root: Path, dataset: str, filename: str, display: str) -> A
                 all_client_ids.update(ids)
                 split_parts.append(f"{split} {count:,}/{distinct_clients:,} clients")
 
+            if dataset == "femnist":
+                required_full_splits = {"all_train", "all_test"}
+                if not required_full_splits.issubset(split_counts):
+                    raise AuditError(
+                        "FEMNIST full-view splits missing: "
+                        + ", ".join(sorted(required_full_splits - split_counts))
+                    )
+                total_samples = split_counts["all_train"] + split_counts["all_test"]
+            else:
+                total_samples = sum(split_counts.values())
+
             null_proto = int(
                 con.execute(
                     "SELECT COUNT(*) FROM examples "
@@ -255,25 +269,64 @@ def audit_tff_sqlite(root: Path, dataset: str, filename: str, display: str) -> A
             if null_proto:
                 raise AuditError(f"{null_proto:,} examples have empty serialized payloads")
 
-            counts = [
-                int(row[0])
-                for row in con.execute(
-                    "SELECT SUM(num_examples) FROM client_metadata "
-                    "GROUP BY client_id ORDER BY client_id"
-                ).fetchall()
-            ]
+            if dataset == "femnist":
+                counts = [
+                    int(row[0])
+                    for row in con.execute(
+                        "SELECT SUM(num_examples) FROM client_metadata "
+                        "WHERE split_name IN ('all_train', 'all_test') "
+                        "GROUP BY client_id ORDER BY client_id"
+                    ).fetchall()
+                ]
+            else:
+                counts = [
+                    int(row[0])
+                    for row in con.execute(
+                        "SELECT SUM(num_examples) FROM client_metadata "
+                        "GROUP BY client_id ORDER BY client_id"
+                    ).fetchall()
+                ]
             if not counts or min(counts) <= 0:
                 raise AuditError("one or more clients have no examples")
 
             result.samples = total_samples
-            result.clients = len(all_client_ids)
-            result.details.extend(
-                [
-                    "splits: " + " | ".join(split_parts),
-                    f"per-client total samples min/median/max {min(counts):,}/{median_int(counts):,}/{max(counts):,}",
-                    "FL mapping: client_id selects that client's local examples; split_name selects train/test data",
-                ]
-            )
+            if dataset == "femnist":
+                full_client_ids = {
+                    str(row[0])
+                    for row in con.execute(
+                        "SELECT DISTINCT client_id FROM examples "
+                        "WHERE split_name IN ('all_train', 'all_test')"
+                    ).fetchall()
+                }
+                result.clients = len(full_client_ids)
+                digits_clients = len(
+                    {
+                        str(row[0])
+                        for row in con.execute(
+                            "SELECT DISTINCT client_id FROM examples "
+                            "WHERE split_name IN ('digits_only_train', 'digits_only_test')"
+                        ).fetchall()
+                    }
+                )
+                result.details.extend(
+                    [
+                        "splits: " + " | ".join(split_parts),
+                        f"headline samples use full FEMNIST view only: {total_samples:,} unique full-view examples",
+                        f"clients full/digits-only {result.clients:,}/{digits_clients:,}",
+                        f"per-client full-view samples min/median/max {min(counts):,}/{median_int(counts):,}/{max(counts):,}",
+                        "FL mapping: use all_train/all_test for the full task; digits_only_* is an alternate subset view",
+                    ]
+                )
+            else:
+                result.clients = len(all_client_ids)
+                result.details.extend(
+                    [
+                        "splits: " + " | ".join(split_parts),
+                        f"per-client total samples min/median/max {min(counts):,}/{median_int(counts):,}/{max(counts):,}",
+                        "FL mapping: client_id selects that client's local examples; split_name selects train/test data",
+                        "training note: naturally tiny clients exist; loader/trainer must tolerate very small local datasets",
+                    ]
+                )
     except (AuditError, sqlite3.DatabaseError) as exc:
         result.fail(str(exc))
     return result
@@ -364,9 +417,6 @@ def audit_nbaiot(root: Path, *, fast: bool, test_fraction: float, seed: int) -> 
         if not device_dirs:
             raise AuditError("no device directories found")
 
-        if not 0.0 < test_fraction < 1.0:
-            raise AuditError("--nbaiot-test-fraction must be between 0 and 1")
-
         total_rows = 0
         all_widths: set[int] = set()
         canonical_header: tuple[str, ...] | None = None
@@ -410,19 +460,12 @@ def audit_nbaiot(root: Path, *, fast: bool, test_fraction: float, seed: int) -> 
                         attack_rows += rows
 
             if not fast:
-                if benign_rows < 2 or attack_rows < 2:
-                    raise AuditError(f"{device.name}: insufficient rows for stratified train/test split")
-                benign_test = max(1, int(round(benign_rows * test_fraction)))
-                attack_test = max(1, int(round(attack_rows * test_fraction)))
-                test_rows = benign_test + attack_test
-                train_rows = device_rows - test_rows
-                if train_rows <= 0:
-                    raise AuditError(f"{device.name}: train split would be empty")
+                if benign_rows <= 0 or attack_rows <= 0:
+                    raise AuditError(f"{device.name}: missing benign or attack rows")
                 total_rows += device_rows
                 device_summaries.append(
                     f"{device.name} {device_rows:,} "
-                    f"(benign {benign_rows:,}/attack {attack_rows:,}; "
-                    f"train {train_rows:,}/test {test_rows:,})"
+                    f"(benign {benign_rows:,}/attack {attack_rows:,})"
                 )
             else:
                 device_summaries.append(f"{device.name} {len(csv_files)} files")
@@ -443,7 +486,9 @@ def audit_nbaiot(root: Path, *, fast: bool, test_fraction: float, seed: int) -> 
                 f"features {next(iter(all_widths))} | CSVs {headered_files + headerless_files} | {header_state}",
                 "clients: " + "; ".join(device_summaries),
                 "labels: CSV filename/path determines benign vs attack class",
-                f"FL mapping: one device = one client; deterministic stratified {int((1-test_fraction)*100)}/{int(test_fraction*100)} local train/test split | seed {seed}",
+                "FL mapping: one physical device = one natural client",
+                "split guidance: avoid random row-level train/test splits; prefer capture/session/time-aware separation when available",
+                "scope note: 3 natural clients is sufficient for a simple FL run, but too small for strong federation-scale claims",
             ]
         )
         if fast:
@@ -492,7 +537,7 @@ def parse_args() -> argparse.Namespace:
         "--nbaiot-test-fraction",
         type=float,
         default=0.20,
-        help="Per-device stratified test fraction to validate (default: 0.20)",
+        help="Deprecated compatibility option; N-BaIoT audit no longer prescribes a random row-level split",
     )
     args = parser.parse_args()
     if "all" in args.datasets and len(args.datasets) != 1:
@@ -547,6 +592,7 @@ def main() -> int:
 
     results: list[AuditResult] = []
     for dataset in selected_datasets(args):
+        print(f"Auditing {dataset}...", file=sys.stderr, flush=True)
         if dataset == "cifar10":
             results.append(
                 audit_cifar10(
@@ -567,6 +613,7 @@ def main() -> int:
             )
         elif dataset == "nbaiot":
             results.append(audit_nbaiot(args.data_dir, fast=args.fast, test_fraction=args.nbaiot_test_fraction, seed=args.seed))
+        print(f"Auditing {dataset}... done", file=sys.stderr, flush=True)
 
     print_report(results, args.data_dir)
     return 1 if any(r.status != "PASS" for r in results) else 0
