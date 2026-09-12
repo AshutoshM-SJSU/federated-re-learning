@@ -246,14 +246,21 @@ def extract_zip_in_place(archive_path: Path, *, dry_run: bool) -> None:
 
 
 def find_rar_extractor() -> tuple[str, str] | None:
-    """Return (kind, executable) for an available RAR-capable tool."""
+    """Return (kind, executable) for an available RAR-capable tool.
+
+    Prefer the official unrar implementation when available because some
+    N-BaIoT RAR archives use compression methods that 7-Zip may list but
+    cannot decode.
+    """
+    resolved = shutil.which("unrar")
+    if resolved:
+        return "unrar", resolved
+
     for executable in ("7z", "7zz", "7za"):
         resolved = shutil.which(executable)
         if resolved:
             return "7z", resolved
-    resolved = shutil.which("unrar")
-    if resolved:
-        return "unrar", resolved
+
     return None
 
 
@@ -297,22 +304,66 @@ def preprocess_nbaiot(root: Path, *, keep_archives: bool, dry_run: bool) -> None
     if not raw.is_dir():
         raise PreprocessError(f"nbaiot: expected directory {raw}")
 
-    archives = list(iter_attack_archives(raw))
-    if archives:
+    # N-BaIoT attack packages may reveal additional archives after extraction.
+    # Keep rescanning until the tree contains no archives (unless the user
+    # explicitly requested --keep-archives).
+    pass_number = 0
+    seen_states: set[tuple[str, ...]] = set()
+    while True:
+        archives = list(iter_attack_archives(raw))
+        if not archives:
+            if pass_number == 0:
+                phase("nbaiot: no compressed attack archives remain")
+            break
+
+        relative_archives = tuple(str(path.relative_to(raw)) for path in archives)
+        if relative_archives in seen_states and not keep_archives:
+            listing = "\n".join(f"  - {name}" for name in relative_archives)
+            raise PreprocessError(
+                "nbaiot: archive extraction made no progress; remaining archives:\n"
+                + listing
+            )
+        seen_states.add(relative_archives)
+
+        pass_number += 1
+        phase(
+            f"nbaiot: archive extraction pass {pass_number} "
+            f"({len(archives)} archive(s))"
+        )
+
+        if dry_run:
+            for archive in archives:
+                print(f"  would extract: {archive.relative_to(raw)}")
+            phase("nbaiot: CSV validation would run after extraction")
+            return
+
         for archive in archives:
             suffix = archive.suffix.casefold()
             if suffix == ".rar":
-                extract_rar_in_place(archive, dry_run=dry_run)
+                extract_rar_in_place(archive, dry_run=False)
             else:
-                extract_zip_in_place(archive, dry_run=dry_run)
-            if not dry_run:
-                remove_file(archive, keep_archives)
-    else:
-        phase("nbaiot: no compressed attack archives remain")
+                extract_zip_in_place(archive, dry_run=False)
 
-    if dry_run:
-        phase("nbaiot: CSV validation would run after extraction")
-        return
+            remove_file(archive, keep_archives)
+            if not keep_archives and archive.exists():
+                raise PreprocessError(
+                    f"nbaiot: extracted archive could not be removed: {archive}"
+                )
+
+        if keep_archives:
+            break
+
+    if not keep_archives:
+        leftovers = list(iter_attack_archives(raw))
+        if leftovers:
+            listing = "\n".join(
+                f"  - {path.relative_to(raw)} ({path.stat().st_size:,} bytes)"
+                for path in leftovers
+            )
+            raise PreprocessError(
+                "nbaiot: preprocessing ended with compressed archives still present:\n"
+                + listing
+            )
 
     csv_files = sorted(raw.rglob("*.csv"))
     if not csv_files:
