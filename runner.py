@@ -24,20 +24,20 @@ Examples
 --------
 Smoke-test the defended CIFAR-10 path:
 
-    python runner.py --dataset cifar10 --scenario defended --smoke-test
+    python runner_e2e.py --dataset cifar10 --scenario defended --smoke-test
 
 Run the complete scenario suite:
 
-    python runner.py --dataset cifar10 --suite --rounds 50
+    python runner_e2e.py --dataset cifar10 --suite --rounds 50
 
 Run FEMNIST with two malicious clients:
 
-    python runner.py --dataset femnist --scenario defended \
+    python runner_e2e.py --dataset femnist --scenario defended \
         --num-attackers 2 --client-fraction 0.10
 
 Run Shakespeare:
 
-    python runner.py --dataset shakespeare --scenario defended \
+    python runner_e2e.py --dataset shakespeare --scenario defended \
         --batch-size 32 --sequence-trigger-token 1
 
 Important DP note
@@ -288,7 +288,7 @@ def _load_from_repo_adapter(args) -> Optional[DataBundle]:
             "nbaiot": 3,
         }[args.dataset],
         cifar_clients=args.num_users or 10,
-        iid=args.iid,
+        iid=args.iid or ("iid" if args.dataset == "cifar10" else "natural"),
         alpha=args.alpha,
         thre_labels=args.thre_labels,
         num_classes=args.num_classes or {
@@ -396,7 +396,94 @@ def _load_from_cleaned_format(args) -> Optional[DataBundle]:
     )
 
 
+
+def _load_cifar10_audited_raw(args) -> Optional[DataBundle]:
+    """Load the repository's audited CIFAR-10 source directly."""
+
+    if args.dataset != "cifar10":
+        return None
+
+    raw_root = args.data_dir / "cifar10" / "raw"
+    batch_dir = raw_root / "cifar-10-batches-py"
+
+    if not batch_dir.is_dir():
+        return None
+
+    try:
+        from torchvision import datasets, transforms
+    except ImportError as exc:
+        raise ImportError(
+            "Direct CIFAR-10 loading requires torchvision."
+        ) from exc
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(
+            (0.4914, 0.4822, 0.4465),
+            (0.2470, 0.2435, 0.2616),
+        ),
+    ])
+
+    train = datasets.CIFAR10(
+        root=str(raw_root),
+        train=True,
+        download=False,
+        transform=transform,
+    )
+    test = datasets.CIFAR10(
+        root=str(raw_root),
+        train=False,
+        download=False,
+        transform=transform,
+    )
+
+    num_clients = int(args.num_users or 10)
+    if num_clients <= 0:
+        raise ValueError("--num-users must be positive.")
+
+    rng = np.random.default_rng(int(args.data_seed))
+    shuffled = rng.permutation(len(train))
+    partitions = np.array_split(shuffled, num_clients)
+
+    client_ids = list(range(num_clients))
+    client_indices = {
+        client_id: [int(index) for index in partitions[client_id].tolist()]
+        for client_id in client_ids
+    }
+
+    return DataBundle(
+        train_dataset=train,
+        test_dataset=test,
+        client_ids=client_ids,
+        client_indices=client_indices,
+        info={
+            "loader": "audited_raw_cifar10",
+            "name": "cifar10",
+            "task": "image_classification",
+            "num_classes": 10,
+            "num_channels": 3,
+            "input_shape": (3, 32, 32),
+            "num_clients": num_clients,
+            "partition": "deterministic_iid",
+            "partition_seed": int(args.data_seed),
+        },
+        manifest={
+            "dataset": "CIFAR-10",
+            "num_classes": 10,
+            "normalization": {
+                "mean": [0.4914, 0.4822, 0.4465],
+                "std": [0.2470, 0.2435, 0.2616],
+            },
+        },
+    )
+
+
 def load_data(args) -> DataBundle:
+    # Prefer the exact audited CIFAR-10 layout used by this repository branch.
+    bundle = _load_cifar10_audited_raw(args)
+    if bundle is not None:
+        return bundle
+
     bundle = _load_from_repo_adapter(args)
     if bundle is not None:
         return bundle
@@ -406,11 +493,10 @@ def load_data(args) -> DataBundle:
         return bundle
 
     raise FileNotFoundError(
-        "No experiment-ready dataset adapter was found. The raw dataset audit "
-        "does not itself tokenize/tensorize training data. Provide "
-        "utils.load_datasets.load_federated_data(...) (preferred), "
-        "utils.data_setup.load_federated_data(...), or the older "
-        "data/<dataset>/cleaned/*.npz artifacts."
+        "No experiment-ready loader was found for this dataset. CIFAR-10 can "
+        "be loaded directly from data/cifar10/raw/cifar-10-batches-py. Other "
+        "datasets currently require the repository's experiment loader or the "
+        "older data/<dataset>/cleaned/*.npz format."
     )
 
 
@@ -1419,7 +1505,7 @@ def parse_args():
 
     # Compatibility arguments for repository data adapters.
     parser.add_argument("--num-users", type=int)
-    parser.add_argument("--iid", default="natural")
+    parser.add_argument("--iid", default=None)
     parser.add_argument("--alpha", type=float, default=0.5)
     parser.add_argument("--thre-labels", type=int, default=2)
     parser.add_argument("--num-classes", type=int)
