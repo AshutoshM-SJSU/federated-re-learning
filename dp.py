@@ -1,14 +1,18 @@
 """Shared differential-privacy utilities for federated-learning experiments.
 
-This module owns the DP configuration and the noise-accounting calculation used
-by the reference RING implementation.  It is intentionally model- and
- dataset-agnostic so the same configuration can be reused by CIFAR-10, FEMNIST,
-Shakespeare, and N-BaIoT experiments.
+This module owns the DP configuration and the reference noise-accounting
+calculation used by the RING implementation.
 
-Local DP-SGD still belongs inside the client-training code because per-example
-gradient clipping and noising must occur while gradients are available.  This
-module provides the shared privacy parameters and accounting utilities that the
-client trainer and attacks such as RING can both import.
+It intentionally depends only on Google's lightweight ``dp-accounting`` package,
+not the full ``tensorflow-privacy`` package. This is useful for modern PyTorch
+environments, including Python 3.12.
+
+The accounting calculation reproduces the logic used by TensorFlow Privacy's
+``compute_noise_from_budget_lib.compute_noise``.
+
+Local DP-SGD still belongs inside client training because per-example gradient
+clipping and gradient noising must occur while gradients are available. This
+module provides only shared privacy configuration and reference accounting.
 """
 
 from __future__ import annotations
@@ -20,27 +24,7 @@ import math
 
 @dataclass(frozen=True)
 class DPConfig:
-    """Differential-privacy configuration shared across the FL project.
-
-    Parameters
-    ----------
-    enabled:
-        If False, DP accounting/noise is disabled.
-    epsilon:
-        Target privacy budget epsilon.
-    delta:
-        Target privacy parameter delta.
-    clip:
-        Clipping norm used by the DP mechanism.
-    local_epochs:
-        Number of local training epochs per selected client.
-    total_fl_epochs:
-        Number of global FL rounds/epochs used by the reference accountant.
-    client_fraction:
-        Fraction of clients selected per global round.
-    accountant_tolerance:
-        Numerical tolerance passed to TensorFlow Privacy's reference accountant.
-    """
+    """Differential-privacy configuration shared across the FL project."""
 
     enabled: bool = True
     epsilon: float = 8.0
@@ -71,42 +55,111 @@ class DPConfig:
 
     @property
     def accountant_epochs(self) -> float:
-        """Reference accounting horizon used by the original implementation."""
-        return self.total_fl_epochs * self.client_fraction * self.local_epochs
+        """Reference accounting horizon used by the RING implementation."""
+        return (
+            self.total_fl_epochs
+            * self.client_fraction
+            * self.local_epochs
+        )
+
+
+def _compute_noise_from_budget(
+    n: int,
+    batch_size: int,
+    target_epsilon: float,
+    epochs: float,
+    delta: float,
+    noise_lower_bound: float,
+) -> float:
+    """Reproduce TensorFlow Privacy's compute_noise helper with dp-accounting.
+
+    This mirrors the algorithm in
+    tensorflow_privacy/privacy/analysis/compute_noise_from_budget_lib.py
+    without importing TensorFlow Privacy itself.
+    """
+
+    try:
+        import dp_accounting
+    except ImportError as exc:
+        raise ImportError(
+            "DP noise accounting requires the lightweight 'dp-accounting' "
+            "package. Install it with: pip install dp-accounting"
+        ) from exc
+
+    if n <= 0:
+        raise ValueError("n must be positive")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if batch_size > n:
+        raise ValueError("n must be greater than or equal to batch_size")
+    if target_epsilon <= 0:
+        raise ValueError("target_epsilon must be positive")
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+    if not 0 < delta < 1:
+        raise ValueError("delta must be in (0, 1)")
+    if noise_lower_bound <= 0:
+        raise ValueError("noise_lower_bound must be positive")
+
+    sampling_probability = batch_size / n
+
+    orders = (
+        [1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 3.0, 3.5, 4.0, 4.5]
+        + list(range(5, 64))
+        + [128, 256, 512]
+    )
+
+    steps = int(math.ceil(epochs * n / batch_size))
+
+    def make_event_from_noise(noise_multiplier: float):
+        return dp_accounting.SelfComposedDpEvent(
+            dp_accounting.PoissonSampledDpEvent(
+                sampling_probability,
+                dp_accounting.GaussianDpEvent(noise_multiplier),
+            ),
+            steps,
+        )
+
+    def make_accountant():
+        return dp_accounting.rdp.RdpAccountant(orders)
+
+    accountant = make_accountant()
+    accountant.compose(make_event_from_noise(noise_lower_bound))
+    initial_epsilon = accountant.get_epsilon(delta)
+
+    # Matches TensorFlow Privacy's reference behavior.
+    if initial_epsilon < target_epsilon:
+        return 0.0
+
+    target_noise = dp_accounting.calibrate_dp_mechanism(
+        make_accountant,
+        make_event_from_noise,
+        target_epsilon,
+        delta,
+        dp_accounting.LowerEndpointAndGuess(
+            noise_lower_bound,
+            noise_lower_bound * 2,
+        ),
+    )
+
+    return float(target_noise)
 
 
 def compute_reference_noise_multiplier(dp: DPConfig) -> float:
-    """Compute the base noise multiplier used by the reference implementation.
-
-    This intentionally reproduces the supplied RING code, which calls
-    ``tensorflow_privacy.compute_noise_from_budget_lib.compute_noise`` with
-    dataset size and batch size both set to one.
-
-    This function is accounting support for reproducing that implementation;
-    it is not, by itself, a complete local DP-SGD training procedure.
-    """
+    """Compute the base noise multiplier used by the reference RING code."""
 
     dp.validate()
+
     if not dp.enabled:
         return 0.0
 
-    try:
-        from tensorflow_privacy.compute_noise_from_budget_lib import compute_noise
-    except ImportError as exc:
-        raise ImportError(
-            "DP noise accounting requires tensorflow-privacy because the "
-            "reference RING implementation uses compute_noise_from_budget_lib."
-        ) from exc
-
-    return float(
-        compute_noise(
-            1,
-            1,
-            dp.epsilon,
-            dp.accountant_epochs,
-            dp.delta,
-            dp.accountant_tolerance,
-        )
+    return _compute_noise_from_budget(
+        n=1,
+        batch_size=1,
+        target_epsilon=dp.epsilon,
+        epochs=dp.accountant_epochs,
+        delta=dp.delta,
+        noise_lower_bound=dp.accountant_tolerance,
     )
 
 
@@ -119,13 +172,9 @@ def compute_client_noise_stds(
 ) -> List[float]:
     """Compute per-client noise standard deviations used by RING.
 
-    For client ``i`` with ``n_i`` local samples, the supplied implementation
-    computes::
+    For client i with n_i samples:
 
         sigma_i = lr * clip * sqrt(local_epochs) / n_i * noise_multiplier
-
-    Keeping this calculation here gives every experiment one canonical DP
-    accounting implementation and lets RING import it directly.
     """
 
     if learning_rate < 0:
@@ -136,6 +185,7 @@ def compute_client_noise_stds(
         raise ValueError("every client sample count must be positive")
 
     dp.validate()
+
     if not dp.enabled:
         return [0.0 for _ in client_sample_counts]
 
@@ -144,6 +194,7 @@ def compute_client_noise_stds(
         if base_noise_multiplier is None
         else float(base_noise_multiplier)
     )
+
     if multiplier < 0:
         raise ValueError("base_noise_multiplier must be non-negative")
 
