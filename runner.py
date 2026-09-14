@@ -416,25 +416,36 @@ def _load_cifar10_audited_raw(args) -> Optional[DataBundle]:
             "Direct CIFAR-10 loading requires torchvision."
         ) from exc
 
-    transform = transforms.Compose([
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(
             (0.4914, 0.4822, 0.4465),
             (0.2470, 0.2435, 0.2616),
         ),
     ])
-
+    
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(
+            (0.4914, 0.4822, 0.4465),
+            (0.2470, 0.2435, 0.2616),
+        ),
+    ])
+    
     train = datasets.CIFAR10(
         root=str(raw_root),
         train=True,
         download=False,
-        transform=transform,
+        transform=train_transform,
     )
+    
     test = datasets.CIFAR10(
         root=str(raw_root),
         train=False,
         download=False,
-        transform=transform,
+        transform=test_transform,
     )
 
     num_clients = int(args.num_users or 10)
@@ -693,7 +704,7 @@ def round_learning_rate(config: RunConfig, round_idx: int) -> float:
 
     progress = (round_idx - 1) / max(config.rounds - 1, 1)
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return config.learning_rate * (0.1 + 0.9 * cosine)
+    return config.learning_rate * cosine
 
 
 def make_optimizer(model, config: RunConfig, lr: float):
@@ -1468,7 +1479,7 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--optimizer", choices=("sgd", "adam"))
-    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--weight-decay", type=float, default=0.0005)
     parser.add_argument("--momentum", type=float, default=0.9)
 
     parser.add_argument("--num-attackers", type=int, default=2)
@@ -1561,7 +1572,7 @@ def scenario_config(args, bundle: DataBundle, scenario: str) -> RunConfig:
     learning_rate = args.learning_rate
     if learning_rate is None:
         learning_rate = {
-            "cifar10": 0.05,
+            "cifar10": 0.1,
             "femnist": 0.05,
             "shakespeare": 2e-3,
             "nbaiot": 1e-3,
