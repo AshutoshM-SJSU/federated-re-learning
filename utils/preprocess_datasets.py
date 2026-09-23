@@ -1,395 +1,572 @@
 #!/usr/bin/env python3
-"""Prepare installed federated-learning datasets in place.
+"""Download bounded raw datasets for federated-learning simulations.
 
-This script intentionally performs only storage/data-hygiene preprocessing:
-- decompress/extract downloaded archives,
-- validate expected dataset structure,
-- validate SQLite and CSV readability,
-- remove source archives after successful extraction/decompression by default.
-
-It does NOT normalize features, tokenize text, create batches, create simulated
-clients, repartition naturally federated datasets, or construct model tensors.
-Those experiment-specific operations should happen when the FL dataset is loaded.
+This script performs acquisition only. It intentionally does not normalize,
+partition, augment, label, tokenize, or construct train/test splits. A separate
+preprocessing script should transform the files installed under ``data/``.
 
 Examples:
-    python utils/preprocess_datasets.py all
-    python utils/preprocess_datasets.py cifar10 femnist
-    python utils/preprocess_datasets.py shakespeare
-    python utils/preprocess_datasets.py nbaiot
-    python utils/preprocess_datasets.py all --keep-archives
-    python utils/preprocess_datasets.py all --dry-run
+    python utils/install_datasets.py all --dry-run
+    python utils/install_datasets.py all
+    python utils/install_datasets.py cifar10 femnist
+    python utils/install_datasets.py shakespeare
+    python utils/install_datasets.py nbaiot --nbaiot-devices Danmini_Doorbell
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
-import lzma
+import hashlib
+import json
 import os
 import shutil
-import sqlite3
-import subprocess
 import sys
-import tarfile
 import tempfile
+import time
+import urllib.error
+import urllib.request
 import zipfile
+from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Sequence
+from typing import BinaryIO, Iterable, Sequence
 
 
+GIB = 1024**3
+MIB = 1024**2
 DATASETS = ("cifar10", "femnist", "shakespeare", "nbaiot")
-COPY_CHUNK = 1024 * 1024
+USER_AGENT = "bounded-fl-raw-data-installer/2.0"
 
 
-class PreprocessError(RuntimeError):
-    """Raised when a dataset cannot be safely prepared."""
+@dataclass(frozen=True)
+class Source:
+    url: str
+    filename: str
+    expected_bytes: int
+    expected_is_approximate: bool = False
+    probe_head: bool = True
+    sha256: str | None = None
+    md5: str | None = None
+
+
+@dataclass(frozen=True)
+class FileRecord:
+    path: str
+    bytes: int
+    sha256: str
+
+
+SOURCES = {
+    "cifar10": Source(
+        url="https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz",
+        filename="cifar-10-python.tar.gz",
+        expected_bytes=170_498_071,
+        md5="c58f30108f718f92721af3b95e74349a",
+    ),
+    "femnist": Source(
+        url="https://storage.googleapis.com/tff-datasets-public/emnist_all.sqlite.lzma",
+        filename="emnist_all.sqlite.lzma",
+        expected_bytes=170_500_000,
+    ),
+    "shakespeare": Source(
+        url="https://storage.googleapis.com/tff-datasets-public/shakespeare.sqlite.lzma",
+        filename="shakespeare.sqlite.lzma",
+        expected_bytes=1_329_828,
+    ),
+    "nbaiot": Source(
+        url=(
+            "https://archive.ics.uci.edu/static/public/442/"
+            "detection+of+iot+botnet+attacks+n+baiot.zip"
+        ),
+        filename="n-baiot.zip",
+        expected_bytes=1_700_000_000,
+        expected_is_approximate=True,
+        probe_head=False,
+    ),
+}
+
+NBAIOT_DEFAULT_DEVICES = (
+    "Danmini_Doorbell",
+    "Ecobee_Thermostat",
+    "Provision_PT_737E_Security_Camera",
+)
+
+
+class BudgetError(RuntimeError):
+    """Raised when an installation safety limit would be exceeded."""
+
+
+@dataclass
+class Budget:
+    max_download: int
+    max_work: int
+    max_output: int
+    downloaded: int = 0
+    output_written: int = 0
+
+    def add_download(self, amount: int) -> None:
+        self.downloaded += amount
+        if self.downloaded > self.max_download:
+            raise BudgetError(
+                f"Download budget exceeded: {human(self.downloaded)} > "
+                f"{human(self.max_download)}. Raise --max-download-gb explicitly."
+            )
 
 
 def phase(message: str) -> None:
     print(f"\n==> {message}")
 
 
-def safe_relative_path(name: str) -> Path:
-    """Return a safe relative archive path or raise."""
-    normalized = name.replace("\\", "/")
-    parsed = PurePosixPath(normalized)
-    if parsed.is_absolute() or ".." in parsed.parts:
-        raise PreprocessError(f"Unsafe archive member path: {name!r}")
-    parts = [part for part in parsed.parts if part not in ("", ".")]
-    if not parts:
-        raise PreprocessError(f"Empty archive member path: {name!r}")
-    return Path(*parts)
+def human(size: int) -> str:
+    if size >= GIB:
+        return f"{size / GIB:.2f} GiB"
+    return f"{size / MIB:.1f} MiB"
 
 
-def atomic_replace_from_stream(reader, destination: Path) -> None:
-    """Write reader contents to destination atomically."""
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+def duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+class Progress:
+    """Render a live terminal bar or periodic progress lines for redirected logs."""
+
+    def __init__(
+        self,
+        label: str,
+        total: int,
+        *,
+        approximate: bool = False,
+        enabled: bool = True,
+    ) -> None:
+        self.label = label
+        self.total = total
+        self.approximate = approximate
+        self.enabled = enabled
+        self.completed = 0
+        self.started = time.monotonic()
+        self.last_rendered = 0.0
+        self.last_width = 0
+        self.stream = sys.stderr
+        self.interactive = self.stream.isatty()
+
+    def __enter__(self) -> Progress:
+        self.render(force=True)
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.render(force=True)
+        if self.enabled and self.interactive:
+            print(file=self.stream, flush=True)
+
+    def update(self, amount: int) -> None:
+        self.completed += amount
+        self.render()
+
+    def render(self, *, force: bool = False) -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        interval = 0.15 if self.interactive else 5.0
+        if not force and now - self.last_rendered < interval:
+            return
+        self.last_rendered = now
+
+        elapsed = max(now - self.started, 1e-6)
+        rate = self.completed / elapsed
+        fraction = min(self.completed / self.total, 1.0) if self.total else 0.0
+        percent = 100 * fraction
+        eta = (self.total - self.completed) / rate if rate and self.total else None
+        eta_text = duration(eta) if eta is not None else "--:--"
+        total_marker = "~" if self.approximate else ""
+        quantities = (
+            f"{human(self.completed)}/{total_marker}{human(self.total)} "
+            f"{human(int(rate))}/s ETA {eta_text}"
+        )
+
+        if self.interactive:
+            bar_width = 28
+            filled = int(bar_width * fraction)
+            bar = "█" * filled + "░" * (bar_width - filled)
+            line = f"{self.label} [{bar}] {percent:6.2f}% {quantities}"
+            print(
+                "\r" + line.ljust(self.last_width),
+                end="",
+                file=self.stream,
+                flush=True,
+            )
+            self.last_width = max(self.last_width, len(line))
+        else:
+            print(
+                f"{self.label}: {percent:.2f}% {quantities}",
+                file=self.stream,
+                flush=True,
+            )
+
+
+def directory_size(path: Path) -> int:
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
+def make_request(url: str, method: str = "GET") -> urllib.request.Request:
+    return urllib.request.Request(
+        url,
+        method=method,
+        headers={"User-Agent": USER_AGENT},
     )
-    temp_path = Path(temp_name)
-    try:
-        with os.fdopen(fd, "wb") as output:
+
+
+def source_size(source: Source) -> tuple[int, bool]:
+    """Return source size and whether the value is a documented estimate."""
+    if source.probe_head:
+        try:
+            with urllib.request.urlopen(make_request(source.url, "HEAD"), timeout=30) as response:
+                value = response.headers.get("Content-Length")
+                if value:
+                    return int(value), False
+        except (urllib.error.URLError, ValueError):
+            pass
+    return source.expected_bytes, source.expected_is_approximate
+
+
+def check_free_space(path: Path, required: int) -> None:
+    free = shutil.disk_usage(path).free
+    if free < required:
+        raise BudgetError(
+            f"Insufficient free space: {human(free)} available; "
+            f"at least {human(required)} required."
+        )
+
+
+def download(
+    source: Source,
+    target: Path,
+    budget: Budget,
+    show_progress: bool = True,
+) -> FileRecord:
+    declared, declared_is_approximate = source_size(source)
+    if budget.downloaded + declared > budget.max_download:
+        raise BudgetError(
+            f"{source.filename} would exceed the run's "
+            f"{human(budget.max_download)} download budget."
+        )
+    if declared > budget.max_work:
+        raise BudgetError(
+            f"{source.filename} exceeds --max-work-gb ({human(budget.max_work)})."
+        )
+    check_free_space(target.parent, declared + 512 * MIB)
+
+    sha256 = hashlib.sha256()
+    md5 = hashlib.md5(  # noqa: S324 - official CIFAR compatibility checksum
+        usedforsecurity=False
+    )
+    bytes_written = 0
+    with urllib.request.urlopen(make_request(source.url), timeout=120) as response, target.open(
+        "wb"
+    ) as output:
+        content_length = response.headers.get("Content-Length")
+        try:
+            response_bytes = int(content_length) if content_length else None
+        except ValueError:
+            response_bytes = None
+        progress_total = response_bytes if response_bytes is not None else declared
+        with Progress(
+            f"Downloading {source.filename}",
+            progress_total,
+            approximate=response_bytes is None and declared_is_approximate,
+            enabled=show_progress,
+        ) as progress:
             while True:
-                chunk = reader.read(COPY_CHUNK)
+                chunk = response.read(MIB)
                 if not chunk:
                     break
+                budget.add_download(len(chunk))
                 output.write(chunk)
-        temp_path.replace(destination)
+                sha256.update(chunk)
+                md5.update(chunk)
+                bytes_written += len(chunk)
+                progress.update(len(chunk))
+
+    if response_bytes is not None and bytes_written != response_bytes:
+        raise RuntimeError(
+            f"Incomplete download for {source.filename}: received "
+            f"{human(bytes_written)} of {human(response_bytes)}."
+        )
+    if source.sha256 and sha256.hexdigest() != source.sha256:
+        raise RuntimeError(f"SHA-256 verification failed for {source.filename}.")
+    if source.md5 and md5.hexdigest() != source.md5:
+        raise RuntimeError(f"MD5 verification failed for {source.filename}.")
+    return FileRecord(source.filename, bytes_written, sha256.hexdigest())
+
+
+def write_manifest(directory: Path, payload: dict) -> None:
+    manifest = {
+        "installer_version": 2,
+        "stage": "raw_acquisition",
+        "requires_preprocessing": True,
+        **payload,
+    }
+    (directory / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def prepare_destination(
+    data_dir: Path,
+    dataset: str,
+    force: bool,
+    nbaiot_devices: Sequence[str] | None = None,
+) -> tuple[Path, Path] | None:
+    destination = (data_dir / dataset).resolve()
+    if data_dir.resolve() not in destination.parents:
+        raise RuntimeError("Refusing to write outside the configured data directory.")
+    manifest_path = destination / "manifest.json"
+    if manifest_path.exists() and not force:
+        if nbaiot_devices is None:
+            phase(f"{dataset}: already installed; skipping")
+            return None
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            installed_devices = manifest.get("selected_devices", [])
+        except (OSError, json.JSONDecodeError):
+            installed_devices = []
+        requested = {device.casefold() for device in nbaiot_devices}
+        installed = {
+            device.casefold()
+            for device in installed_devices
+            if isinstance(device, str)
+        }
+        if requested == installed:
+            phase(f"{dataset}: requested devices already installed; skipping")
+            return None
+        phase(f"{dataset}: requested devices changed; replacing installation")
+    staging = data_dir / f".staging-{dataset}-{os.getpid()}"
+    if staging.exists():
+        shutil.rmtree(staging)
+    (staging / "raw").mkdir(parents=True)
+    return staging, destination
+
+
+def finalize(staging: Path, destination: Path, budget: Budget) -> int:
+    size = directory_size(staging)
+    projected = budget.output_written + size
+    if projected > budget.max_output:
+        raise BudgetError(
+            f"This run would retain {human(projected)}, above --max-output-gb "
+            f"({human(budget.max_output)})."
+        )
+
+    backup = destination.with_name(f".{destination.name}.old-{os.getpid()}")
+    if backup.exists():
+        shutil.rmtree(backup)
+    if destination.exists():
+        destination.rename(backup)
+    try:
+        staging.rename(destination)
     except Exception:
-        temp_path.unlink(missing_ok=True)
+        if backup.exists() and not destination.exists():
+            backup.rename(destination)
+        raise
+    budget.output_written += size
+    if backup.exists():
+        shutil.rmtree(backup)
+    return size
+
+
+def install_sources(
+    args: argparse.Namespace,
+    budget: Budget,
+    dataset: str,
+    source_keys: Sequence[str],
+    description: str,
+) -> None:
+    prepared = prepare_destination(args.data_dir, dataset, args.force)
+    if prepared is None:
+        return
+    staging, destination = prepared
+    phase(f"{dataset}: downloading raw source data")
+    records: list[FileRecord] = []
+    try:
+        for key in source_keys:
+            source = SOURCES[key]
+            target = staging / "raw" / source.filename
+            record = download(
+                source,
+                target,
+                budget,
+                show_progress=not args.no_progress,
+            )
+            records.append(FileRecord(f"raw/{record.path}", record.bytes, record.sha256))
+        write_manifest(
+            staging,
+            {
+                "dataset": description,
+                "files": [asdict(record) for record in records],
+                "sources": [SOURCES[key].url for key in source_keys],
+            },
+        )
+        retained = finalize(staging, destination, budget)
+        phase(f"{dataset}: installed {human(retained)}")
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
         raise
 
 
-def remove_file(path: Path, keep_archives: bool) -> None:
-    if keep_archives:
-        return
-    path.unlink(missing_ok=True)
+def safe_zip_parts(name: str) -> tuple[str, ...] | None:
+    normalized = name.replace("\\", "/")
+    path = PurePosixPath(normalized)
+    if path.is_absolute() or ".." in path.parts:
+        return None
+    return tuple(part for part in path.parts if part not in ("", "."))
 
 
-def validate_sqlite(path: Path, required_table: str | None = None) -> None:
-    if not path.is_file() or path.stat().st_size == 0:
-        raise PreprocessError(f"SQLite file is missing or empty: {path}")
-    try:
-        with sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True) as connection:
-            result = connection.execute("PRAGMA quick_check").fetchone()
-            if not result or result[0] != "ok":
-                raise PreprocessError(f"SQLite integrity check failed for {path}: {result}")
-            tables = {
-                row[0]
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-            }
-            if not tables:
-                raise PreprocessError(f"SQLite database contains no tables: {path}")
-            if required_table and required_table not in tables:
-                raise PreprocessError(
-                    f"SQLite database {path} does not contain expected table "
-                    f"{required_table!r}; found {sorted(tables)}"
-                )
-    except sqlite3.DatabaseError as exc:
-        raise PreprocessError(f"Invalid SQLite database {path}: {exc}") from exc
-
-
-def decompress_lzma(source: Path, destination: Path, *, dry_run: bool) -> None:
-    if destination.exists():
-        validate_sqlite(destination)
-        phase(f"{destination.name}: already decompressed and valid")
-        return
-    if not source.is_file():
-        raise PreprocessError(f"Missing compressed source: {source}")
-    phase(f"decompressing {source.name} -> {destination.name}")
-    if dry_run:
-        return
-    try:
-        with lzma.open(source, "rb") as reader:
-            atomic_replace_from_stream(reader, destination)
-    except lzma.LZMAError as exc:
-        destination.unlink(missing_ok=True)
-        raise PreprocessError(f"Could not decompress {source}: {exc}") from exc
-    validate_sqlite(destination)
-
-
-def extract_tar_gz(source: Path, destination: Path, *, dry_run: bool) -> None:
-    phase(f"extracting {source.name}")
-    if dry_run:
-        return
-    destination.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(source, "r:gz") as archive:
-        members = archive.getmembers()
-        for member in members:
-            safe_relative_path(member.name)
-            if member.issym() or member.islnk():
-                raise PreprocessError(
-                    f"Refusing symbolic/hard link in archive: {member.name!r}"
-                )
-        archive.extractall(destination, members=members)
-
-
-def validate_cifar(directory: Path) -> None:
-    expected = [
-        *(f"data_batch_{index}" for index in range(1, 6)),
-        "test_batch",
-        "batches.meta",
-    ]
-    missing = [name for name in expected if not (directory / name).is_file()]
-    if missing:
-        raise PreprocessError(
-            "CIFAR-10 extraction is incomplete; missing: " + ", ".join(missing)
-        )
-
-
-def preprocess_cifar10(root: Path, *, keep_archives: bool, dry_run: bool) -> None:
-    raw = root / "cifar10" / "raw"
-    archive = raw / "cifar-10-python.tar.gz"
-    extracted = raw / "cifar-10-batches-py"
-
-    if extracted.is_dir():
-        validate_cifar(extracted)
-        phase("cifar10: extracted files already present and valid")
-        if not dry_run:
-            remove_file(archive, keep_archives)
-        return
-    if not archive.is_file():
-        raise PreprocessError(f"cifar10: expected {archive}")
-
-    extract_tar_gz(archive, raw, dry_run=dry_run)
-    if not dry_run:
-        validate_cifar(extracted)
-        remove_file(archive, keep_archives)
-    phase("cifar10: ready")
-
-
-def preprocess_femnist(root: Path, *, keep_archives: bool, dry_run: bool) -> None:
-    raw = root / "femnist" / "raw"
-    source = raw / "emnist_all.sqlite.lzma"
-    destination = raw / "emnist_all.sqlite"
-    decompress_lzma(source, destination, dry_run=dry_run)
-    if not dry_run:
-        remove_file(source, keep_archives)
-    phase("femnist: federated SQLite data ready")
-
-
-def preprocess_shakespeare(root: Path, *, keep_archives: bool, dry_run: bool) -> None:
-    raw = root / "shakespeare" / "raw"
-    source = raw / "shakespeare.sqlite.lzma"
-    destination = raw / "shakespeare.sqlite"
-    decompress_lzma(source, destination, dry_run=dry_run)
-    if not dry_run:
-        remove_file(source, keep_archives)
-    phase("shakespeare: federated SQLite data ready")
-
-
-def csv_has_consistent_width(path: Path) -> tuple[int, int]:
-    """Return (columns, sampled_rows) after a lightweight CSV sanity check."""
-    columns: int | None = None
-    sampled = 0
-    try:
-        with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.reader(handle)
-            for row in reader:
-                if not row:
-                    continue
-                if columns is None:
-                    columns = len(row)
-                    if columns == 0:
-                        raise PreprocessError(f"CSV has no columns: {path}")
-                elif len(row) != columns:
-                    raise PreprocessError(
-                        f"CSV row-width mismatch in {path}: expected {columns}, got {len(row)}"
-                    )
-                sampled += 1
-                if sampled >= 1000:
-                    break
-    except UnicodeDecodeError as exc:
-        raise PreprocessError(f"CSV is not valid UTF-8 text: {path}") from exc
-    if columns is None or sampled == 0:
-        raise PreprocessError(f"CSV is empty: {path}")
-    return columns, sampled
-
-
-def extract_zip_in_place(archive_path: Path, *, dry_run: bool) -> None:
-    target_dir = archive_path.parent
-    phase(f"extracting {archive_path.relative_to(target_dir.parent)}")
-    if dry_run:
-        return
-    with zipfile.ZipFile(archive_path) as archive:
-        for info in archive.infolist():
-            if info.is_dir():
-                continue
-            relative = safe_relative_path(info.filename)
-            target = target_dir / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(info) as reader:
-                atomic_replace_from_stream(reader, target)
-
-
-def find_rar_extractor() -> tuple[str, str] | None:
-    """Return (kind, executable) for an available RAR-capable tool.
-
-    Prefer the official unrar implementation when available because some
-    N-BaIoT RAR archives use compression methods that 7-Zip may list but
-    cannot decode.
-    """
-    resolved = shutil.which("unrar")
-    if resolved:
-        return "unrar", resolved
-
-    for executable in ("7z", "7zz", "7za"):
-        resolved = shutil.which(executable)
-        if resolved:
-            return "7z", resolved
-
+def selected_nbaiot_path(
+    member_name: str,
+    devices: Sequence[str],
+) -> tuple[str, Path] | None:
+    parts = safe_zip_parts(member_name)
+    if not parts:
+        return None
+    for device in devices:
+        for index, part in enumerate(parts):
+            if part.casefold() == device.casefold():
+                return device, Path(device, *parts[index + 1 :])
     return None
 
 
-def extract_rar_in_place(archive_path: Path, *, dry_run: bool) -> None:
-    phase(f"extracting {archive_path.name}")
-    if dry_run:
-        return
-    extractor = find_rar_extractor()
-    if extractor is None:
-        raise PreprocessError(
-            f"Cannot extract {archive_path.name}: install 7-Zip (7z) or unrar and "
-            "ensure it is available on PATH."
-        )
-    kind, executable = extractor
-    if kind == "7z":
-        command = [executable, "x", "-y", f"-o{archive_path.parent}", str(archive_path)]
-    else:
-        command = [executable, "x", "-o+", str(archive_path), str(archive_path.parent)]
-    result = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
+def copy_with_hash(
+    reader: BinaryIO,
+    target: Path,
+    progress: Progress | None = None,
+) -> FileRecord:
+    digest = hashlib.sha256()
+    bytes_written = 0
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("wb") as output:
+        while True:
+            chunk = reader.read(MIB)
+            if not chunk:
+                break
+            output.write(chunk)
+            digest.update(chunk)
+            bytes_written += len(chunk)
+            if progress is not None:
+                progress.update(len(chunk))
+    return FileRecord(str(target), bytes_written, digest.hexdigest())
+
+
+def install_nbaiot(args: argparse.Namespace, budget: Budget) -> None:
+    prepared = prepare_destination(
+        args.data_dir,
+        "nbaiot",
+        args.force,
+        nbaiot_devices=args.nbaiot_devices,
     )
-    if result.returncode != 0:
-        tail = "\n".join(result.stdout.splitlines()[-12:])
-        raise PreprocessError(
-            f"RAR extraction failed for {archive_path} (exit {result.returncode}):\n{tail}"
-        )
-
-
-def iter_attack_archives(raw: Path) -> Iterable[Path]:
-    for path in sorted(raw.rglob("*")):
-        if path.is_file() and path.suffix.casefold() in {".rar", ".zip"}:
-            yield path
-
-
-def preprocess_nbaiot(root: Path, *, keep_archives: bool, dry_run: bool) -> None:
-    raw = root / "nbaiot" / "raw"
-    if not raw.is_dir():
-        raise PreprocessError(f"nbaiot: expected directory {raw}")
-
-    # N-BaIoT attack packages may reveal additional archives after extraction.
-    # Keep rescanning until the tree contains no archives (unless the user
-    # explicitly requested --keep-archives).
-    pass_number = 0
-    seen_states: set[tuple[str, ...]] = set()
-    while True:
-        archives = list(iter_attack_archives(raw))
-        if not archives:
-            if pass_number == 0:
-                phase("nbaiot: no compressed attack archives remain")
-            break
-
-        relative_archives = tuple(str(path.relative_to(raw)) for path in archives)
-        if relative_archives in seen_states and not keep_archives:
-            listing = "\n".join(f"  - {name}" for name in relative_archives)
-            raise PreprocessError(
-                "nbaiot: archive extraction made no progress; remaining archives:\n"
-                + listing
+    if prepared is None:
+        return
+    staging, destination = prepared
+    phase("nbaiot: downloading UCI archive and retaining selected raw device packages")
+    try:
+        with tempfile.TemporaryDirectory(dir=args.data_dir) as temp_name:
+            archive_path = Path(temp_name) / SOURCES["nbaiot"].filename
+            archive_record = download(
+                SOURCES["nbaiot"],
+                archive_path,
+                budget,
+                show_progress=not args.no_progress,
             )
-        seen_states.add(relative_archives)
+            records: list[FileRecord] = []
+            observed = {
+                device: {"benign": False, "attack": False}
+                for device in args.nbaiot_devices
+            }
+            with zipfile.ZipFile(archive_path) as archive:
+                selected: list[tuple[zipfile.ZipInfo, str, Path]] = []
+                for member in archive.infolist():
+                    if member.is_dir():
+                        continue
+                    match = selected_nbaiot_path(member.filename, args.nbaiot_devices)
+                    if match is not None:
+                        device, relative = match
+                        selected.append((member, device, relative))
+                if not selected:
+                    raise RuntimeError("No requested N-BaIoT device packages were found.")
 
-        pass_number += 1
-        phase(
-            f"nbaiot: archive extraction pass {pass_number} "
-            f"({len(archives)} archive(s))"
-        )
+                selected_bytes = sum(member.file_size for member, _, _ in selected)
+                peak_work = archive_record.bytes + selected_bytes
+                if peak_work > budget.max_work:
+                    raise BudgetError(
+                        "The N-BaIoT archive and selected extracted files require "
+                        f"approximately {human(peak_work)} together, above "
+                        f"--max-work-gb ({human(budget.max_work)})."
+                    )
+                if budget.output_written + selected_bytes > budget.max_output:
+                    raise BudgetError(
+                        "Selected N-BaIoT raw files would exceed --max-output-gb."
+                    )
+                check_free_space(args.data_dir, selected_bytes + 512 * MIB)
 
-        if dry_run:
-            for archive in archives:
-                print(f"  would extract: {archive.relative_to(raw)}")
-            phase("nbaiot: CSV validation would run after extraction")
-            return
+                phase(
+                    f"nbaiot: extracting {len(selected)} selected files "
+                    f"({human(selected_bytes)})"
+                )
+                with Progress(
+                    "Extracting selected N-BaIoT files",
+                    selected_bytes,
+                    enabled=not args.no_progress,
+                ) as progress:
+                    for member, device, relative in selected:
+                        target = staging / "raw" / relative
+                        with archive.open(member) as reader:
+                            record = copy_with_hash(reader, target, progress)
+                        records.append(
+                            FileRecord(
+                                str(target.relative_to(staging)),
+                                record.bytes,
+                                record.sha256,
+                            )
+                        )
+                        lowered = member.filename.casefold()
+                        if "benign" in lowered and lowered.endswith(".csv"):
+                            observed[device]["benign"] = True
+                        if "attack" in lowered and lowered.endswith(
+                            (".rar", ".zip", ".csv")
+                        ):
+                            observed[device]["attack"] = True
 
-        for archive in archives:
-            suffix = archive.suffix.casefold()
-            if suffix == ".rar":
-                extract_rar_in_place(archive, dry_run=False)
-            else:
-                extract_zip_in_place(archive, dry_run=False)
-
-            remove_file(archive, keep_archives)
-            if not keep_archives and archive.exists():
-                raise PreprocessError(
-                    f"nbaiot: extracted archive could not be removed: {archive}"
+            incomplete = [
+                device
+                for device, roles in observed.items()
+                if not roles["benign"] or not roles["attack"]
+            ]
+            if incomplete:
+                raise RuntimeError(
+                    "Missing benign or attack packages for: " + ", ".join(incomplete)
                 )
 
-        if keep_archives:
-            break
-
-    if not keep_archives:
-        leftovers = list(iter_attack_archives(raw))
-        if leftovers:
-            listing = "\n".join(
-                f"  - {path.relative_to(raw)} ({path.stat().st_size:,} bytes)"
-                for path in leftovers
-            )
-            raise PreprocessError(
-                "nbaiot: preprocessing ended with compressed archives still present:\n"
-                + listing
-            )
-
-    csv_files = sorted(raw.rglob("*.csv"))
-    if not csv_files:
-        raise PreprocessError("nbaiot: no CSV files found after archive extraction")
-
-    benign_files = [path for path in csv_files if "benign" in path.name.casefold()]
-    attack_files = [path for path in csv_files if "benign" not in path.name.casefold()]
-    if not benign_files:
-        raise PreprocessError("nbaiot: no benign CSV files found")
-    if not attack_files:
-        raise PreprocessError("nbaiot: no attack CSV files found")
-
-    phase(f"nbaiot: validating {len(csv_files)} CSV files")
-    widths: set[int] = set()
-    for path in csv_files:
-        columns, _ = csv_has_consistent_width(path)
-        widths.add(columns)
-    if len(widths) != 1:
-        raise PreprocessError(
-            f"nbaiot: inconsistent feature widths across CSV files: {sorted(widths)}"
+        write_manifest(
+            staging,
+            {
+                "dataset": "N-BaIoT selected-device raw packages",
+                "source": SOURCES["nbaiot"].url,
+                "source_archive": {
+                    **asdict(archive_record),
+                    "retained": False,
+                },
+                "selected_devices": list(args.nbaiot_devices),
+                "files": [asdict(record) for record in records],
+                "note": "Attack packages remain compressed and require preprocessing.",
+            },
         )
-
-    phase(
-        f"nbaiot: ready ({len(benign_files)} benign CSVs, "
-        f"{len(attack_files)} attack CSVs, {next(iter(widths))} columns)"
-    )
+        retained = finalize(staging, destination, budget)
+        phase(f"nbaiot: installed {human(retained)}")
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
 
 def parse_args() -> argparse.Namespace:
@@ -399,74 +576,132 @@ def parse_args() -> argparse.Namespace:
         "datasets",
         nargs="+",
         choices=(*DATASETS, "all"),
-        help="One or more installed datasets, or all datasets.",
+        help="One or more datasets, or all datasets.",
     )
     parser.add_argument(
         "--data-dir",
         type=Path,
         default=repo_root / "data",
-        help="Dataset directory (default: repository-level data/).",
+        help="Output directory (default: repository-level data/).",
     )
+    parser.add_argument("--force", action="store_true", help="Replace selected datasets.")
+    parser.add_argument("--dry-run", action="store_true", help="Show source sizes and exit.")
     parser.add_argument(
-        "--keep-archives",
+        "--no-progress",
         action="store_true",
-        help="Keep compressed source archives after successful preprocessing.",
+        help="Disable download and extraction progress output.",
     )
+    parser.add_argument("--max-download-gb", type=float, default=4.0)
+    parser.add_argument("--max-work-gb", type=float, default=4.0)
+    parser.add_argument("--max-output-gb", type=float, default=3.0)
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show preprocessing actions without changing files.",
+        "--nbaiot-devices",
+        nargs="+",
+        default=list(NBAIOT_DEFAULT_DEVICES),
+        help="N-BaIoT device directories to retain from the full UCI archive.",
     )
     args = parser.parse_args()
     args.data_dir = args.data_dir.expanduser().resolve()
-    if "all" in args.datasets and len(args.datasets) != 1:
-        parser.error("Use 'all' alone, or list individual dataset names.")
     return args
 
 
-def selected_datasets(args: argparse.Namespace) -> Sequence[str]:
+def validate_args(args: argparse.Namespace) -> None:
+    limits = {
+        "--max-download-gb": args.max_download_gb,
+        "--max-work-gb": args.max_work_gb,
+        "--max-output-gb": args.max_output_gb,
+    }
+    invalid = [name for name, value in limits.items() if value <= 0]
+    if invalid:
+        raise SystemExit(f"These parameters must be positive: {', '.join(invalid)}")
+    if "all" in args.datasets and len(args.datasets) != 1:
+        raise SystemExit("Use 'all' alone, or list individual dataset names.")
+    normalized_devices = [device.casefold() for device in args.nbaiot_devices]
+    if len(set(normalized_devices)) != len(normalized_devices):
+        raise SystemExit("--nbaiot-devices cannot contain duplicates.")
+
+
+def selected_datasets(args: argparse.Namespace) -> list[str]:
     if args.datasets == ["all"]:
-        return DATASETS
-    return tuple(dict.fromkeys(args.datasets))
+        return list(DATASETS)
+    return list(dict.fromkeys(args.datasets))
+
+
+def source_keys_for(datasets: Iterable[str]) -> list[str]:
+    return list(datasets)
+
+
+def dry_run(datasets: Sequence[str], max_download: int) -> None:
+    phase("preflight: checking raw source sizes")
+    total = 0
+    for key in source_keys_for(datasets):
+        source = SOURCES[key]
+        size, approximate = source_size(source)
+        marker = "~" if approximate else " "
+        print(f"{key:22s} {marker}{human(size):>11s}  {source.url}")
+        total += size
+    print(f"Expected total: {human(total)}")
+    if total > max_download:
+        raise BudgetError(
+            f"Preflight total exceeds --max-download-gb ({human(max_download)})."
+        )
 
 
 def main() -> None:
     args = parse_args()
+    validate_args(args)
     datasets = selected_datasets(args)
-    if not args.data_dir.is_dir():
-        raise PreprocessError(
-            f"Data directory does not exist: {args.data_dir}. Run install_datasets.py first."
+    budget = Budget(
+        max_download=int(args.max_download_gb * GIB),
+        max_work=int(args.max_work_gb * GIB),
+        max_output=int(args.max_output_gb * GIB),
+    )
+    args.data_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.dry_run:
+        dry_run(datasets, budget.max_download)
+        return
+
+    phase("installation plan")
+    print(f"Datasets:    {', '.join(datasets)}")
+    print(f"Destination: {args.data_dir}")
+    print(
+        "Limits:      "
+        f"{human(budget.max_download)} download, "
+        f"{human(budget.max_work)} working space, "
+        f"{human(budget.max_output)} retained output"
+    )
+
+    if "cifar10" in datasets:
+        install_sources(
+            args, budget, "cifar10", ("cifar10",), "CIFAR-10 raw Python archive"
         )
+    if "femnist" in datasets:
+        install_sources(
+            args,
+            budget,
+            "femnist",
+            ("femnist",),
+            "Federated EMNIST raw TFF SQLite archive",
+        )
+    if "shakespeare" in datasets:
+        install_sources(
+            args,
+            budget,
+            "shakespeare",
+            ("shakespeare",),
+            "Federated Shakespeare raw TFF SQLite archive",
+        )
+    if "nbaiot" in datasets:
+        install_nbaiot(args, budget)
 
-    phase("preprocessing plan")
-    print(f"Datasets:      {', '.join(datasets)}")
-    print(f"Data root:     {args.data_dir}")
-    print(f"Keep archives: {'yes' if args.keep_archives else 'no'}")
-    print(f"Dry run:       {'yes' if args.dry_run else 'no'}")
-
-    for dataset in datasets:
-        if dataset == "cifar10":
-            preprocess_cifar10(
-                args.data_dir, keep_archives=args.keep_archives, dry_run=args.dry_run
-            )
-        elif dataset == "femnist":
-            preprocess_femnist(
-                args.data_dir, keep_archives=args.keep_archives, dry_run=args.dry_run
-            )
-        elif dataset == "shakespeare":
-            preprocess_shakespeare(
-                args.data_dir, keep_archives=args.keep_archives, dry_run=args.dry_run
-            )
-        elif dataset == "nbaiot":
-            preprocess_nbaiot(
-                args.data_dir, keep_archives=args.keep_archives, dry_run=args.dry_run
-            )
-
-    phase("complete: installed dataset folders are ready for FL loading")
+    phase(f"complete: raw data written under {args.data_dir}")
+    print(f"Downloaded this run: {human(budget.downloaded)}")
+    print(f"Retained this run:   {human(budget.output_written)}")
 
 
 if __name__ == "__main__":
     try:
         main()
-    except (PreprocessError, OSError, tarfile.TarError, zipfile.BadZipFile) as exc:
+    except (BudgetError, RuntimeError, urllib.error.URLError, zipfile.BadZipFile) as exc:
         raise SystemExit(f"ERROR: {exc}") from exc
