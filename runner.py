@@ -172,6 +172,7 @@ class ClientResult:
     examples: int
     loss: float
     malicious: bool
+    poisoned_examples: int = 0
 
 
 @dataclass
@@ -425,7 +426,7 @@ def _load_cifar10_audited_raw(args) -> Optional[DataBundle]:
             (0.2470, 0.2435, 0.2616),
         ),
     ])
-    
+
     test_transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(
@@ -433,14 +434,13 @@ def _load_cifar10_audited_raw(args) -> Optional[DataBundle]:
             (0.2470, 0.2435, 0.2616),
         ),
     ])
-    
+
     train = datasets.CIFAR10(
         root=str(raw_root),
         train=True,
         download=False,
         transform=train_transform,
     )
-    
     test = datasets.CIFAR10(
         root=str(raw_root),
         train=False,
@@ -852,6 +852,7 @@ def train_client(
 
     total_loss = 0.0
     total_examples = 0
+    total_poisoned_examples = 0
 
     pad_token_id = int(
         bundle.manifest.get(
@@ -872,7 +873,7 @@ def train_client(
             targets = targets.to(device)
 
             if attack_active:
-                features, targets, _ = poison_batch(
+                features, targets, poisoned_count = poison_batch(
                     features,
                     targets,
                     config=poison,
@@ -886,6 +887,7 @@ def train_client(
                         + batch_idx
                     ),
                 )
+                total_poisoned_examples += int(poisoned_count)
 
             optimizer.zero_grad(set_to_none=True)
             loss = task_loss(
@@ -911,6 +913,7 @@ def train_client(
         examples=len(indices),
         loss=total_loss / max(total_examples, 1),
         malicious=malicious,
+        poisoned_examples=total_poisoned_examples,
     )
 
     del local_model
@@ -1105,8 +1108,21 @@ def evaluate_clean(model, bundle: DataBundle, config: RunConfig, device):
 
 
 @torch.inference_mode()
-def evaluate_asr(model, bundle, config, device, probe_args):
-    """Targeted attack success rate on fully triggered test inputs."""
+def evaluate_backdoor_diagnostics(model, bundle, config, device, probe_args):
+    """Measure whether the trigger itself causes targeted misclassification.
+
+    Metrics:
+      asr:
+        Standard targeted attack success rate on triggered, non-target examples.
+      clean_target_rate:
+        How often the clean model already predicts the attack target on the same
+        eligible examples. This is the baseline that raw ASR does not reveal.
+      conditional_asr:
+        Among eligible examples that the clean model classified correctly, how
+        often adding the trigger flips the prediction to the attack target.
+      target_confidence_lift:
+        Mean increase in attack-target softmax probability caused by the trigger.
+    """
 
     if config.scenario in ("clean", "dp_clean"):
         return None
@@ -1119,35 +1135,103 @@ def evaluate_asr(model, bundle, config, device, probe_args):
         num_workers=0,
     )
 
-    successes = 0
+    target_label = int(config.target_label)
+
     eligible = 0
+    clean_target_count = 0
+    triggered_target_count = 0
+    clean_correct_eligible = 0
+    conditional_successes = 0
+    clean_target_confidence_sum = 0.0
+    triggered_target_confidence_sum = 0.0
 
     for batch in loader:
+        if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+            raise TypeError("Evaluation dataset must yield (features, targets).")
+
         features = batch[0].to(device)
         targets = batch[1].to(device)
-
         triggered = apply_probe_trigger(features, probe_args)
-        logits = unwrap_logits(model(triggered))
 
-        if config.dataset == "shakespeare" and logits.dim() == 3:
-            predictions = logits[:, -1, :].argmax(dim=-1)
+        clean_logits = unwrap_logits(model(features))
+        triggered_logits = unwrap_logits(model(triggered))
+
+        if config.dataset == "shakespeare" and clean_logits.dim() == 3:
+            clean_logits = clean_logits[:, -1, :]
+            triggered_logits = triggered_logits[:, -1, :]
             original_target = targets[:, -1] if targets.dim() > 1 else targets
         else:
-            predictions = logits.argmax(dim=-1)
             original_target = targets
 
-        mask = original_target.ne(int(config.target_label))
-        if mask.ndim > 1:
-            mask = mask.reshape(-1)
+        clean_predictions = clean_logits.argmax(dim=-1)
+        triggered_predictions = triggered_logits.argmax(dim=-1)
 
-        if predictions.ndim > 1:
-            predictions = predictions.reshape(-1)
+        if original_target.ndim > 1:
+            original_target = original_target.reshape(-1)
+        if clean_predictions.ndim > 1:
+            clean_predictions = clean_predictions.reshape(-1)
+        if triggered_predictions.ndim > 1:
+            triggered_predictions = triggered_predictions.reshape(-1)
 
-        valid_predictions = predictions[mask]
-        successes += int(valid_predictions.eq(int(config.target_label)).sum().item())
-        eligible += int(mask.sum().item())
+        mask = original_target.ne(target_label)
+        batch_eligible = int(mask.sum().item())
+        if batch_eligible == 0:
+            continue
 
-    return successes / max(eligible, 1)
+        clean_probabilities = torch.softmax(clean_logits, dim=-1)
+        triggered_probabilities = torch.softmax(triggered_logits, dim=-1)
+
+        eligible += batch_eligible
+        clean_target_count += int(
+            (clean_predictions.eq(target_label) & mask).sum().item()
+        )
+        triggered_target_count += int(
+            (triggered_predictions.eq(target_label) & mask).sum().item()
+        )
+
+        clean_correct_mask = clean_predictions.eq(original_target) & mask
+        clean_correct_eligible += int(clean_correct_mask.sum().item())
+        conditional_successes += int(
+            (triggered_predictions.eq(target_label) & clean_correct_mask).sum().item()
+        )
+
+        clean_target_confidence_sum += float(
+            clean_probabilities[mask, target_label].sum().item()
+        )
+        triggered_target_confidence_sum += float(
+            triggered_probabilities[mask, target_label].sum().item()
+        )
+
+    if eligible == 0:
+        return {
+            "asr": 0.0,
+            "clean_target_rate": 0.0,
+            "conditional_asr": 0.0,
+            "clean_target_confidence": 0.0,
+            "triggered_target_confidence": 0.0,
+            "target_confidence_lift": 0.0,
+            "eligible_examples": 0,
+            "conditional_examples": 0,
+        }
+
+    clean_target_rate = clean_target_count / eligible
+    asr = triggered_target_count / eligible
+    conditional_asr = conditional_successes / max(clean_correct_eligible, 1)
+    clean_target_confidence = clean_target_confidence_sum / eligible
+    triggered_target_confidence = triggered_target_confidence_sum / eligible
+
+    return {
+        "asr": asr,
+        "clean_target_rate": clean_target_rate,
+        "conditional_asr": conditional_asr,
+        "clean_target_confidence": clean_target_confidence,
+        "triggered_target_confidence": triggered_target_confidence,
+        "target_confidence_lift": (
+            triggered_target_confidence - clean_target_confidence
+        ),
+        "eligible_examples": eligible,
+        "conditional_examples": clean_correct_eligible,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1217,9 +1301,10 @@ class Experiment:
                 self.base_noise_multiplier = compute_reference_noise_multiplier(self.dp)
             except ImportError as exc:
                 raise RuntimeError(
-                    "DP/RING scenarios need tensorflow-privacy to compute the "
-                    "reference noise multiplier. Install tensorflow-privacy or "
-                    "pass a precomputed --dp-base-noise-multiplier."
+                    "DP/RING scenarios need dp-accounting to compute the "
+                    "reference noise multiplier. Install it with "
+                    "'pip install dp-accounting' or pass a precomputed "
+                    "--dp-base-noise-multiplier."
                 ) from exc
 
         (self.output_dir / "config.json").write_text(
@@ -1386,13 +1471,14 @@ class Experiment:
                 self.device,
             )
 
-            asr = evaluate_asr(
+            attack_metrics = evaluate_backdoor_diagnostics(
                 self.model,
                 self.bundle,
                 self.config,
                 self.device,
                 probe_args,
             )
+            asr = None if attack_metrics is None else attack_metrics["asr"]
 
             avg_train_loss = (
                 sum(r.loss * r.examples for r in results)
@@ -1412,6 +1498,44 @@ class Experiment:
                 "test_loss": f"{evaluation.loss:.8f}",
                 "clean_accuracy": f"{evaluation.accuracy:.8f}",
                 "asr": "" if asr is None else f"{asr:.8f}",
+                "conditional_asr": (
+                    ""
+                    if attack_metrics is None
+                    else f"{attack_metrics['conditional_asr']:.8f}"
+                ),
+                "clean_target_rate": (
+                    ""
+                    if attack_metrics is None
+                    else f"{attack_metrics['clean_target_rate']:.8f}"
+                ),
+                "clean_target_confidence": (
+                    ""
+                    if attack_metrics is None
+                    else f"{attack_metrics['clean_target_confidence']:.8f}"
+                ),
+                "triggered_target_confidence": (
+                    ""
+                    if attack_metrics is None
+                    else f"{attack_metrics['triggered_target_confidence']:.8f}"
+                ),
+                "target_confidence_lift": (
+                    ""
+                    if attack_metrics is None
+                    else f"{attack_metrics['target_confidence_lift']:.8f}"
+                ),
+                "attack_eligible_examples": (
+                    ""
+                    if attack_metrics is None
+                    else int(attack_metrics["eligible_examples"])
+                ),
+                "conditional_examples": (
+                    ""
+                    if attack_metrics is None
+                    else int(attack_metrics["conditional_examples"])
+                ),
+                "poisoned_examples": sum(
+                    int(result.poisoned_examples) for result in results
+                ),
                 "selected_clients": len(selected),
                 "selected_attackers": selected_attackers,
                 "total_attackers": len(self.malicious_clients),
@@ -1434,11 +1558,28 @@ class Experiment:
                 )
 
             asr_text = "-" if asr is None else f"{asr:.4f}"
+            conditional_asr_text = (
+                "-"
+                if attack_metrics is None
+                else f"{attack_metrics['conditional_asr']:.4f}"
+            )
+            confidence_lift_text = (
+                "-"
+                if attack_metrics is None
+                else f"{attack_metrics['target_confidence_lift']:.4f}"
+            )
+            poisoned_examples = sum(
+                int(result.poisoned_examples) for result in results
+            )
+
             print(
                 f"[{self.config.scenario}] round {round_idx:03d}: "
                 f"train_loss={avg_train_loss:.4f} "
                 f"clean_acc={evaluation.accuracy:.4f} "
                 f"asr={asr_text} "
+                f"conditional_asr={conditional_asr_text} "
+                f"confidence_lift={confidence_lift_text} "
+                f"poisoned={poisoned_examples} "
                 f"clients={len(selected)} attackers={selected_attackers} "
                 f"time={elapsed:.1f}s"
             )
@@ -1494,7 +1635,7 @@ def parse_args():
         type=float,
         help=(
             "Optional precomputed reference DP noise multiplier. "
-            "When omitted, dp.py computes it with tensorflow-privacy."
+            "When omitted, dp.py computes it with dp-accounting."
         ),
     )
     parser.add_argument("--ring-group-size", type=int, default=-1)
