@@ -120,14 +120,37 @@ def apply_probe_trigger(x, args):
         col = width - patch
 
         if dataset in ("cifar", "cifar10", "cifar-10") and channels == 3:
-            mean = torch.tensor([0.4914, 0.4822, 0.4465], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
-            std = torch.tensor([0.2470, 0.2435, 0.2616], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
-            x[:, :, :patch, col:] = (torch.ones_like(mean) - mean) / std
+            mean = torch.tensor(
+                [0.4914, 0.4822, 0.4465],
+                device=x.device,
+                dtype=x.dtype,
+            ).view(1, 3, 1, 1)
+        
+            std = torch.tensor(
+                [0.2470, 0.2435, 0.2616],
+                device=x.device,
+                dtype=x.dtype,
+            ).view(1, 3, 1, 1)
+        
+            x[:, :, :patch, col:] = (
+                torch.ones_like(mean) - mean
+            ) / std
+        
+        elif dataset == "femnist" and channels == 1:
+            # FEMNIST normalization:
+            # (1.0 - 0.5) / 0.5 = 1.0
+            x[:, :, :patch, col:] = 1.0
+        
         else:
             value = getattr(args, "probe_image_value", None)
-            value = max(1.0, float(x.detach().max())) if value is None else float(value)
+        
+            value = (
+                max(1.0, float(x.detach().max()))
+                if value is None
+                else float(value)
+            )
+        
             x[:, :, :patch, col:] = value
-        return x
 
     if dataset in ("shakespeare", "shake") and x.dim() >= 2:
         repeat = min(max(1, int(getattr(args, "probe_trigger_repeat", 3))), x.shape[-1])
