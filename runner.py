@@ -655,237 +655,237 @@ def _load_cifar10_audited_raw(args) -> Optional[DataBundle]:
     )
 
     def _load_femnist_audited_raw(args) -> Optional[DataBundle]:
-    """Load the audited natural-client FEMNIST SQLite dataset."""
-
-    if args.dataset != "femnist":
-        return None
-
-    database = (
-        args.data_dir
-        / "femnist"
-        / "raw"
-        / "emnist_all.sqlite"
-    )
-
-    if not database.is_file():
-        return None
-
-    train_split = "full_train"
-    test_split = "full_test"
-
-    num_clients = int(args.num_users or 3400)
-
-    if num_clients <= 0:
-        raise ValueError("--num-users must be positive.")
-
-    max_per_client = int(
-        getattr(args, "max_samples_per_client", 0)
-    )
-
-    max_test_samples = int(
-        getattr(args, "max_test_samples", 0)
-    )
-
-    uri = f"file:{database.as_posix()}?mode=ro"
-
-    train_images = []
-    train_labels = []
-
-    test_images = []
-    test_labels = []
-
-    client_indices = {}
-
-    with sqlite3.connect(uri, uri=True) as connection:
-        rows = connection.execute(
-            """
-            SELECT train.client_id
-            FROM client_metadata AS train
-            JOIN client_metadata AS test
-              ON train.client_id = test.client_id
-            WHERE train.split_name = ?
-              AND test.split_name = ?
-              AND train.num_examples > 0
-              AND test.num_examples > 0
-            ORDER BY train.client_id
-            """,
-            (train_split, test_split),
-        ).fetchall()
-
-        available_clients = [
-            str(row[0])
-            for row in rows
-        ]
-
-        if num_clients > len(available_clients):
-            raise ValueError(
-                f"Requested {num_clients} FEMNIST clients, "
-                f"but only {len(available_clients)} are available."
-            )
-
-        rng = random.Random(int(args.data_seed))
-        rng.shuffle(available_clients)
-
-        selected_clients = available_clients[:num_clients]
-
-        for client_number, client_id in enumerate(
-            selected_clients
-        ):
-            train_rows = connection.execute(
+        """Load the audited natural-client FEMNIST SQLite dataset."""
+    
+        if args.dataset != "femnist":
+            return None
+    
+        database = (
+            args.data_dir
+            / "femnist"
+            / "raw"
+            / "emnist_all.sqlite"
+        )
+    
+        if not database.is_file():
+            return None
+    
+        train_split = "full_train"
+        test_split = "full_test"
+    
+        num_clients = int(args.num_users or 3400)
+    
+        if num_clients <= 0:
+            raise ValueError("--num-users must be positive.")
+    
+        max_per_client = int(
+            getattr(args, "max_samples_per_client", 0)
+        )
+    
+        max_test_samples = int(
+            getattr(args, "max_test_samples", 0)
+        )
+    
+        uri = f"file:{database.as_posix()}?mode=ro"
+    
+        train_images = []
+        train_labels = []
+    
+        test_images = []
+        test_labels = []
+    
+        client_indices = {}
+    
+        with sqlite3.connect(uri, uri=True) as connection:
+            rows = connection.execute(
                 """
-                SELECT serialized_example_proto
-                FROM examples
-                WHERE split_name = ?
-                  AND client_id = ?
-                ORDER BY rowid
+                SELECT train.client_id
+                FROM client_metadata AS train
+                JOIN client_metadata AS test
+                  ON train.client_id = test.client_id
+                WHERE train.split_name = ?
+                  AND test.split_name = ?
+                  AND train.num_examples > 0
+                  AND test.num_examples > 0
+                ORDER BY train.client_id
                 """,
-                (train_split, client_id),
+                (train_split, test_split),
             ).fetchall()
-
-            if (
-                max_per_client > 0
-                and len(train_rows) > max_per_client
+    
+            available_clients = [
+                str(row[0])
+                for row in rows
+            ]
+    
+            if num_clients > len(available_clients):
+                raise ValueError(
+                    f"Requested {num_clients} FEMNIST clients, "
+                    f"but only {len(available_clients)} are available."
+                )
+    
+            rng = random.Random(int(args.data_seed))
+            rng.shuffle(available_clients)
+    
+            selected_clients = available_clients[:num_clients]
+    
+            for client_number, client_id in enumerate(
+                selected_clients
             ):
-                client_rng = np.random.default_rng(
-                    int(args.data_seed) + client_number
-                )
-
-                chosen = client_rng.choice(
-                    len(train_rows),
-                    size=max_per_client,
-                    replace=False,
-                )
-
-                chosen = sorted(
-                    int(index)
-                    for index in chosen
-                )
-
-                train_rows = [
-                    train_rows[index]
-                    for index in chosen
-                ]
-
-            indices = []
-
-            for (serialized,) in train_rows:
-                image, label = _decode_femnist_example(
-                    serialized
-                )
-
-                index = len(train_images)
-
-                train_images.append(image)
-                train_labels.append(label)
-                indices.append(index)
-
-            if not indices:
-                raise RuntimeError(
-                    f"FEMNIST client {client_id} has "
-                    "no training examples."
-                )
-
-            client_indices[client_id] = indices
-
-            test_rows = connection.execute(
-                """
-                SELECT serialized_example_proto
-                FROM examples
-                WHERE split_name = ?
-                  AND client_id = ?
-                ORDER BY rowid
-                """,
-                (test_split, client_id),
-            ).fetchall()
-
-            for (serialized,) in test_rows:
-                image, label = _decode_femnist_example(
-                    serialized
-                )
-
-                test_images.append(image)
-                test_labels.append(label)
-
-    if not train_images or not test_images:
-        raise RuntimeError(
-            "FEMNIST loader produced an empty dataset."
+                train_rows = connection.execute(
+                    """
+                    SELECT serialized_example_proto
+                    FROM examples
+                    WHERE split_name = ?
+                      AND client_id = ?
+                    ORDER BY rowid
+                    """,
+                    (train_split, client_id),
+                ).fetchall()
+    
+                if (
+                    max_per_client > 0
+                    and len(train_rows) > max_per_client
+                ):
+                    client_rng = np.random.default_rng(
+                        int(args.data_seed) + client_number
+                    )
+    
+                    chosen = client_rng.choice(
+                        len(train_rows),
+                        size=max_per_client,
+                        replace=False,
+                    )
+    
+                    chosen = sorted(
+                        int(index)
+                        for index in chosen
+                    )
+    
+                    train_rows = [
+                        train_rows[index]
+                        for index in chosen
+                    ]
+    
+                indices = []
+    
+                for (serialized,) in train_rows:
+                    image, label = _decode_femnist_example(
+                        serialized
+                    )
+    
+                    index = len(train_images)
+    
+                    train_images.append(image)
+                    train_labels.append(label)
+                    indices.append(index)
+    
+                if not indices:
+                    raise RuntimeError(
+                        f"FEMNIST client {client_id} has "
+                        "no training examples."
+                    )
+    
+                client_indices[client_id] = indices
+    
+                test_rows = connection.execute(
+                    """
+                    SELECT serialized_example_proto
+                    FROM examples
+                    WHERE split_name = ?
+                      AND client_id = ?
+                    ORDER BY rowid
+                    """,
+                    (test_split, client_id),
+                ).fetchall()
+    
+                for (serialized,) in test_rows:
+                    image, label = _decode_femnist_example(
+                        serialized
+                    )
+    
+                    test_images.append(image)
+                    test_labels.append(label)
+    
+        if not train_images or not test_images:
+            raise RuntimeError(
+                "FEMNIST loader produced an empty dataset."
+            )
+    
+        train_x = torch.from_numpy(
+            np.stack(train_images)
+        ).float()
+    
+        train_y = torch.tensor(
+            train_labels,
+            dtype=torch.long,
         )
-
-    train_x = torch.from_numpy(
-        np.stack(train_images)
-    ).float()
-
-    train_y = torch.tensor(
-        train_labels,
-        dtype=torch.long,
-    )
-
-    test_x = torch.from_numpy(
-        np.stack(test_images)
-    ).float()
-
-    test_y = torch.tensor(
-        test_labels,
-        dtype=torch.long,
-    )
-
-    if (
-        max_test_samples > 0
-        and len(test_y) > max_test_samples
-    ):
-        generator = torch.Generator()
-        generator.manual_seed(
-            int(args.data_seed) + 100_000
+    
+        test_x = torch.from_numpy(
+            np.stack(test_images)
+        ).float()
+    
+        test_y = torch.tensor(
+            test_labels,
+            dtype=torch.long,
         )
-
-        selected = torch.randperm(
-            len(test_y),
-            generator=generator,
-        )[:max_test_samples]
-
-        test_x = test_x[selected]
-        test_y = test_y[selected]
-
-    client_ids = list(client_indices.keys())
-
-    print(
-        f"FEMNIST loaded: "
-        f"{len(train_y):,} train, "
-        f"{len(test_y):,} test, "
-        f"{len(client_ids):,} natural clients"
-    )
-
-    return DataBundle(
-        train_dataset=TensorPairDataset(
-            train_x,
-            train_y,
-        ),
-        test_dataset=TensorPairDataset(
-            test_x,
-            test_y,
-        ),
-        client_ids=client_ids,
-        client_indices=client_indices,
-        info={
-            "loader": "audited_raw_femnist",
-            "name": "femnist",
-            "task": "image_classification",
-            "num_classes": 62,
-            "num_channels": 1,
-            "input_shape": (1, 28, 28),
-            "num_clients": len(client_ids),
-            "partition": "natural_client_id",
-            "partition_seed": int(args.data_seed),
-        },
-        manifest={
-            "dataset": "FEMNIST",
-            "num_classes": 62,
-            "normalization": {
-                "mean": [0.5],
-                "std": [0.5],
+    
+        if (
+            max_test_samples > 0
+            and len(test_y) > max_test_samples
+        ):
+            generator = torch.Generator()
+            generator.manual_seed(
+                int(args.data_seed) + 100_000
+            )
+    
+            selected = torch.randperm(
+                len(test_y),
+                generator=generator,
+            )[:max_test_samples]
+    
+            test_x = test_x[selected]
+            test_y = test_y[selected]
+    
+        client_ids = list(client_indices.keys())
+    
+        print(
+            f"FEMNIST loaded: "
+            f"{len(train_y):,} train, "
+            f"{len(test_y):,} test, "
+            f"{len(client_ids):,} natural clients"
+        )
+    
+        return DataBundle(
+            train_dataset=TensorPairDataset(
+                train_x,
+                train_y,
+            ),
+            test_dataset=TensorPairDataset(
+                test_x,
+                test_y,
+            ),
+            client_ids=client_ids,
+            client_indices=client_indices,
+            info={
+                "loader": "audited_raw_femnist",
+                "name": "femnist",
+                "task": "image_classification",
+                "num_classes": 62,
+                "num_channels": 1,
+                "input_shape": (1, 28, 28),
+                "num_clients": len(client_ids),
+                "partition": "natural_client_id",
+                "partition_seed": int(args.data_seed),
             },
-        },
-    )
+            manifest={
+                "dataset": "FEMNIST",
+                "num_classes": 62,
+                "normalization": {
+                    "mean": [0.5],
+                    "std": [0.5],
+                },
+            },
+        )
 
 def load_data(args) -> DataBundle:
     # Direct loaders for the repository's audited raw datasets.
