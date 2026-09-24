@@ -85,6 +85,7 @@ import json
 import math
 import os
 import random
+import sqlite3
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -234,6 +235,171 @@ class TensorPairDataset(Dataset):
     def __getitem__(self, index):
         return self.x[index], self.y[index]
 
+def _tensorflow_example_class():
+    """Create the minimal TensorFlow Example protobuf type needed by FEMNIST."""
+
+    try:
+        from google.protobuf import descriptor_pb2
+        from google.protobuf import descriptor_pool
+        from google.protobuf import message_factory
+    except ImportError as exc:
+        raise ImportError(
+            "FEMNIST loading requires protobuf: pip install protobuf"
+        ) from exc
+
+    file_desc = descriptor_pb2.FileDescriptorProto()
+    file_desc.name = "tensorflow_example.proto"
+    file_desc.package = "tensorflow"
+    file_desc.syntax = "proto3"
+
+    # BytesList
+    message = file_desc.message_type.add()
+    message.name = "BytesList"
+
+    field = message.field.add()
+    field.name = "value"
+    field.number = 1
+    field.label = field.LABEL_REPEATED
+    field.type = field.TYPE_BYTES
+
+    # FloatList
+    message = file_desc.message_type.add()
+    message.name = "FloatList"
+
+    field = message.field.add()
+    field.name = "value"
+    field.number = 1
+    field.label = field.LABEL_REPEATED
+    field.type = field.TYPE_FLOAT
+    field.options.packed = True
+
+    # Int64List
+    message = file_desc.message_type.add()
+    message.name = "Int64List"
+
+    field = message.field.add()
+    field.name = "value"
+    field.number = 1
+    field.label = field.LABEL_REPEATED
+    field.type = field.TYPE_INT64
+    field.options.packed = True
+
+    # Feature
+    message = file_desc.message_type.add()
+    message.name = "Feature"
+
+    oneof = message.oneof_decl.add()
+    oneof.name = "kind"
+
+    field = message.field.add()
+    field.name = "bytes_list"
+    field.number = 1
+    field.label = field.LABEL_OPTIONAL
+    field.type = field.TYPE_MESSAGE
+    field.type_name = ".tensorflow.BytesList"
+    field.oneof_index = 0
+
+    field = message.field.add()
+    field.name = "float_list"
+    field.number = 2
+    field.label = field.LABEL_OPTIONAL
+    field.type = field.TYPE_MESSAGE
+    field.type_name = ".tensorflow.FloatList"
+    field.oneof_index = 0
+
+    field = message.field.add()
+    field.name = "int64_list"
+    field.number = 3
+    field.label = field.LABEL_OPTIONAL
+    field.type = field.TYPE_MESSAGE
+    field.type_name = ".tensorflow.Int64List"
+    field.oneof_index = 0
+
+    # Features map
+    message = file_desc.message_type.add()
+    message.name = "Features"
+
+    entry = message.nested_type.add()
+    entry.name = "FeatureEntry"
+    entry.options.map_entry = True
+
+    field = entry.field.add()
+    field.name = "key"
+    field.number = 1
+    field.label = field.LABEL_OPTIONAL
+    field.type = field.TYPE_STRING
+
+    field = entry.field.add()
+    field.name = "value"
+    field.number = 2
+    field.label = field.LABEL_OPTIONAL
+    field.type = field.TYPE_MESSAGE
+    field.type_name = ".tensorflow.Feature"
+
+    field = message.field.add()
+    field.name = "feature"
+    field.number = 1
+    field.label = field.LABEL_REPEATED
+    field.type = field.TYPE_MESSAGE
+    field.type_name = ".tensorflow.Features.FeatureEntry"
+
+    # Example
+    message = file_desc.message_type.add()
+    message.name = "Example"
+
+    field = message.field.add()
+    field.name = "features"
+    field.number = 1
+    field.label = field.LABEL_OPTIONAL
+    field.type = field.TYPE_MESSAGE
+    field.type_name = ".tensorflow.Features"
+
+    pool = descriptor_pool.DescriptorPool()
+    pool.Add(file_desc)
+
+    descriptor = pool.FindMessageTypeByName(
+        "tensorflow.Example"
+    )
+
+    return message_factory.GetMessageClass(descriptor)
+
+
+_FEMNIST_EXAMPLE_CLASS = None
+
+
+def _decode_femnist_example(serialized):
+    global _FEMNIST_EXAMPLE_CLASS
+
+    if _FEMNIST_EXAMPLE_CLASS is None:
+        _FEMNIST_EXAMPLE_CLASS = _tensorflow_example_class()
+
+    example = _FEMNIST_EXAMPLE_CLASS()
+    example.ParseFromString(serialized)
+
+    features = example.features.feature
+
+    pixels = np.asarray(
+        features["pixels"].float_list.value,
+        dtype=np.float32,
+    )
+
+    if pixels.size != 784:
+        raise ValueError(
+            f"Unexpected FEMNIST pixel count: {pixels.size}"
+        )
+
+    labels = features["label"].int64_list.value
+
+    if len(labels) != 1:
+        raise ValueError("Invalid FEMNIST label.")
+
+    image = pixels.reshape(1, 28, 28)
+
+    # Official FEMNIST pixels are in [0, 1].
+    # Normalize into [-1, 1].
+    image = (image - 0.5) / 0.5
+
+    return image, int(labels[0])
 
 def _canonical_client_mapping(mapping) -> tuple[list, Dict[Any, list]]:
     if not isinstance(mapping, Mapping) or not mapping:
@@ -396,7 +562,7 @@ def _load_from_cleaned_format(args) -> Optional[DataBundle]:
         train_arrays=train,
     )
 
-
+  
 
 def _load_cifar10_audited_raw(args) -> Optional[DataBundle]:
     """Load the repository's audited CIFAR-10 source directly."""
@@ -488,10 +654,246 @@ def _load_cifar10_audited_raw(args) -> Optional[DataBundle]:
         },
     )
 
+    def _load_femnist_audited_raw(args) -> Optional[DataBundle]:
+    """Load the audited natural-client FEMNIST SQLite dataset."""
+
+    if args.dataset != "femnist":
+        return None
+
+    database = (
+        args.data_dir
+        / "femnist"
+        / "raw"
+        / "emnist_all.sqlite"
+    )
+
+    if not database.is_file():
+        return None
+
+    train_split = "full_train"
+    test_split = "full_test"
+
+    num_clients = int(args.num_users or 3400)
+
+    if num_clients <= 0:
+        raise ValueError("--num-users must be positive.")
+
+    max_per_client = int(
+        getattr(args, "max_samples_per_client", 0)
+    )
+
+    max_test_samples = int(
+        getattr(args, "max_test_samples", 0)
+    )
+
+    uri = f"file:{database.as_posix()}?mode=ro"
+
+    train_images = []
+    train_labels = []
+
+    test_images = []
+    test_labels = []
+
+    client_indices = {}
+
+    with sqlite3.connect(uri, uri=True) as connection:
+        rows = connection.execute(
+            """
+            SELECT train.client_id
+            FROM client_metadata AS train
+            JOIN client_metadata AS test
+              ON train.client_id = test.client_id
+            WHERE train.split_name = ?
+              AND test.split_name = ?
+              AND train.num_examples > 0
+              AND test.num_examples > 0
+            ORDER BY train.client_id
+            """,
+            (train_split, test_split),
+        ).fetchall()
+
+        available_clients = [
+            str(row[0])
+            for row in rows
+        ]
+
+        if num_clients > len(available_clients):
+            raise ValueError(
+                f"Requested {num_clients} FEMNIST clients, "
+                f"but only {len(available_clients)} are available."
+            )
+
+        rng = random.Random(int(args.data_seed))
+        rng.shuffle(available_clients)
+
+        selected_clients = available_clients[:num_clients]
+
+        for client_number, client_id in enumerate(
+            selected_clients
+        ):
+            train_rows = connection.execute(
+                """
+                SELECT serialized_example_proto
+                FROM examples
+                WHERE split_name = ?
+                  AND client_id = ?
+                ORDER BY rowid
+                """,
+                (train_split, client_id),
+            ).fetchall()
+
+            if (
+                max_per_client > 0
+                and len(train_rows) > max_per_client
+            ):
+                client_rng = np.random.default_rng(
+                    int(args.data_seed) + client_number
+                )
+
+                chosen = client_rng.choice(
+                    len(train_rows),
+                    size=max_per_client,
+                    replace=False,
+                )
+
+                chosen = sorted(
+                    int(index)
+                    for index in chosen
+                )
+
+                train_rows = [
+                    train_rows[index]
+                    for index in chosen
+                ]
+
+            indices = []
+
+            for (serialized,) in train_rows:
+                image, label = _decode_femnist_example(
+                    serialized
+                )
+
+                index = len(train_images)
+
+                train_images.append(image)
+                train_labels.append(label)
+                indices.append(index)
+
+            if not indices:
+                raise RuntimeError(
+                    f"FEMNIST client {client_id} has "
+                    "no training examples."
+                )
+
+            client_indices[client_id] = indices
+
+            test_rows = connection.execute(
+                """
+                SELECT serialized_example_proto
+                FROM examples
+                WHERE split_name = ?
+                  AND client_id = ?
+                ORDER BY rowid
+                """,
+                (test_split, client_id),
+            ).fetchall()
+
+            for (serialized,) in test_rows:
+                image, label = _decode_femnist_example(
+                    serialized
+                )
+
+                test_images.append(image)
+                test_labels.append(label)
+
+    if not train_images or not test_images:
+        raise RuntimeError(
+            "FEMNIST loader produced an empty dataset."
+        )
+
+    train_x = torch.from_numpy(
+        np.stack(train_images)
+    ).float()
+
+    train_y = torch.tensor(
+        train_labels,
+        dtype=torch.long,
+    )
+
+    test_x = torch.from_numpy(
+        np.stack(test_images)
+    ).float()
+
+    test_y = torch.tensor(
+        test_labels,
+        dtype=torch.long,
+    )
+
+    if (
+        max_test_samples > 0
+        and len(test_y) > max_test_samples
+    ):
+        generator = torch.Generator()
+        generator.manual_seed(
+            int(args.data_seed) + 100_000
+        )
+
+        selected = torch.randperm(
+            len(test_y),
+            generator=generator,
+        )[:max_test_samples]
+
+        test_x = test_x[selected]
+        test_y = test_y[selected]
+
+    client_ids = list(client_indices.keys())
+
+    print(
+        f"FEMNIST loaded: "
+        f"{len(train_y):,} train, "
+        f"{len(test_y):,} test, "
+        f"{len(client_ids):,} natural clients"
+    )
+
+    return DataBundle(
+        train_dataset=TensorPairDataset(
+            train_x,
+            train_y,
+        ),
+        test_dataset=TensorPairDataset(
+            test_x,
+            test_y,
+        ),
+        client_ids=client_ids,
+        client_indices=client_indices,
+        info={
+            "loader": "audited_raw_femnist",
+            "name": "femnist",
+            "task": "image_classification",
+            "num_classes": 62,
+            "num_channels": 1,
+            "input_shape": (1, 28, 28),
+            "num_clients": len(client_ids),
+            "partition": "natural_client_id",
+            "partition_seed": int(args.data_seed),
+        },
+        manifest={
+            "dataset": "FEMNIST",
+            "num_classes": 62,
+            "normalization": {
+                "mean": [0.5],
+                "std": [0.5],
+            },
+        },
+    )
 
 def load_data(args) -> DataBundle:
-    # Prefer the exact audited CIFAR-10 layout used by this repository branch.
+    # Direct loaders for the repository's audited raw datasets.
     bundle = _load_cifar10_audited_raw(args)
+    if bundle is not None:
+        return bundle
+
+    bundle = _load_femnist_audited_raw(args)
     if bundle is not None:
         return bundle
 
@@ -504,10 +906,8 @@ def load_data(args) -> DataBundle:
         return bundle
 
     raise FileNotFoundError(
-        "No experiment-ready loader was found for this dataset. CIFAR-10 can "
-        "be loaded directly from data/cifar10/raw/cifar-10-batches-py. Other "
-        "datasets currently require the repository's experiment loader or the "
-        "older data/<dataset>/cleaned/*.npz format."
+        "No experiment-ready loader was found for "
+        f"{args.dataset!r}."
     )
 
 
@@ -1663,6 +2063,25 @@ def parse_args():
     parser.add_argument("--num-classes", type=int)
     parser.add_argument("--test-fraction", type=float, default=0.20)
     parser.add_argument("--sequence-length", type=int, default=80)
+    parser.add_argument(
+        "--max-samples-per-client",
+        type=int,
+        default=0,
+        help=(
+            "Maximum training examples retained per client. "
+            "0 uses all available examples."
+        ),
+    )
+    
+    parser.add_argument(
+        "--max-test-samples",
+        type=int,
+        default=0,
+        help=(
+            "Maximum global test examples retained. "
+            "0 uses all available examples."
+        ),
+    )
 
     parser.add_argument(
         "--smoke-test",
