@@ -1830,7 +1830,7 @@ def evaluate_backdoor_diagnostics(model, bundle, config, device, probe_args):
 
         features = batch[0].to(device)
         targets = batch[1].to(device)
-        triggered = apply_probe_trigger(features, probe_args)
+        triggered = apply_probe_trigger(features.clone(), probe_args)
 
         clean_logits = unwrap_logits(model(features))
         triggered_logits = unwrap_logits(model(triggered))
@@ -2292,6 +2292,7 @@ def parse_args():
     parser.add_argument("--data-dir", type=Path, default=repo_root / "data")
     parser.add_argument("--output-dir", type=Path, default=repo_root / "results")
     parser.add_argument("--run-name")
+    parser.add_argument("--init-checkpoint", type=Path)
 
     parser.add_argument("--rounds", type=int, default=20)
     parser.add_argument("--client-fraction", type=float, default=0.5)
@@ -2514,6 +2515,19 @@ def main():
 
         set_seed(config.seed)
         model = build_repo_model(config.dataset, bundle)
+
+        if args.init_checkpoint is not None:
+            checkpoint = torch.load(
+                args.init_checkpoint,
+                map_location="cpu",
+            )
+        
+            model.load_state_dict(checkpoint["model"])
+        
+            print(
+                f"loaded initial checkpoint: "
+                f"{args.init_checkpoint}"
+            )
 
         parameters = sum(
             parameter.numel()
