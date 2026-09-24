@@ -697,7 +697,8 @@ def _load_femnist_audited_raw(args) -> Optional[DataBundle]:
     client_indices = {}
 
     with sqlite3.connect(uri, uri=True) as connection:
-        # Select natural writer clients from the official training split.
+        # Select natural writer clients that have examples in both
+        # the official training and test splits.
         rows = connection.execute(
             """
             SELECT train.client_id
@@ -800,11 +801,11 @@ def _load_femnist_audited_raw(args) -> Optional[DataBundle]:
             client_indices[client_id] = indices
 
         # ---------------------------------------------------------------
-        # Global evaluation data
+        # Evaluation data from the same selected writer population
         # ---------------------------------------------------------------
 
         test_rows = []
-        
+
         for client_id in selected_clients:
             client_test_rows = connection.execute(
                 """
@@ -816,7 +817,7 @@ def _load_femnist_audited_raw(args) -> Optional[DataBundle]:
                 """,
                 (test_split, client_id),
             ).fetchall()
-        
+
             test_rows.extend(client_test_rows)
 
         if not test_rows:
@@ -824,7 +825,7 @@ def _load_femnist_audited_raw(args) -> Optional[DataBundle]:
                 f"No FEMNIST examples found in split {test_split!r}."
             )
 
-        # Cap the centralized test set before decoding it.
+        # Cap the test set before decoding it.
         if (
             max_test_samples > 0
             and len(test_rows) > max_test_samples
@@ -891,7 +892,10 @@ def _load_femnist_audited_raw(args) -> Optional[DataBundle]:
 
     client_ids = list(client_indices.keys())
 
-    # Useful sanity checks.
+    # -------------------------------------------------------------------
+    # Label sanity checks
+    # -------------------------------------------------------------------
+
     train_min_label = int(train_y.min().item())
     train_max_label = int(train_y.max().item())
 
@@ -909,6 +913,69 @@ def _load_femnist_audited_raw(args) -> Optional[DataBundle]:
             "Unexpected FEMNIST test labels: "
             f"{test_min_label} to {test_max_label}"
         )
+
+    # -------------------------------------------------------------------
+    # Class-distribution diagnostics
+    # -------------------------------------------------------------------
+
+    train_class_counts = torch.bincount(
+        train_y,
+        minlength=62,
+    )
+
+    test_class_counts = torch.bincount(
+        test_y,
+        minlength=62,
+    )
+
+    least_train_classes = torch.argsort(
+        train_class_counts
+    )[:10]
+
+    most_train_classes = torch.argsort(
+        train_class_counts,
+        descending=True,
+    )[:10]
+
+    print(
+        "FEMNIST training class samples: "
+        f"min={int(train_class_counts.min())}, "
+        f"median={int(train_class_counts.float().median())}, "
+        f"max={int(train_class_counts.max())}"
+    )
+
+    print(
+        "FEMNIST least represented training classes:",
+        [
+            (
+                int(label),
+                int(train_class_counts[label]),
+            )
+            for label in least_train_classes
+        ],
+    )
+
+    print(
+        "FEMNIST most represented training classes:",
+        [
+            (
+                int(label),
+                int(train_class_counts[label]),
+            )
+            for label in most_train_classes
+        ],
+    )
+
+    print(
+        "FEMNIST test class samples: "
+        f"min={int(test_class_counts.min())}, "
+        f"median={int(test_class_counts.float().median())}, "
+        f"max={int(test_class_counts.max())}"
+    )
+
+    # -------------------------------------------------------------------
+    # Dataset summary
+    # -------------------------------------------------------------------
 
     print(
         f"FEMNIST loaded: "
@@ -964,6 +1031,8 @@ def _load_femnist_audited_raw(args) -> Optional[DataBundle]:
             },
         },
     )
+
+
 
 def load_data(args) -> DataBundle:
     # Direct loaders for the repository's audited raw datasets.
@@ -1177,6 +1246,9 @@ def apply_update(model, update):
 
 
 def round_learning_rate(config: RunConfig, round_idx: int) -> float:
+    if config.dataset == "femnist":
+        return config.learning_rate
+
     if config.rounds <= 1:
         return config.learning_rate
 
