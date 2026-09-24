@@ -2016,8 +2016,41 @@ class Experiment:
             int(round(len(self.bundle.client_ids) * self.config.client_fraction)),
         )
         count = min(count, len(self.bundle.client_ids))
-
+    
         rng = random.Random(self.config.seed + round_idx)
+    
+        if self.config.scenario in ("backdoor", "ring", "defended"):
+            # Preserve the global malicious-client fraction among participants.
+            malicious_count = int(round(
+                count * len(self.malicious_clients) / len(self.bundle.client_ids)
+            ))
+    
+            if self.config.scenario in ("ring", "defended"):
+                malicious_count = max(2, malicious_count)
+    
+            malicious_count = min(
+                malicious_count,
+                len(self.malicious_clients),
+                count,
+            )
+    
+            malicious_pool = list(self.malicious_clients)
+            benign_pool = [
+                client_id
+                for client_id in self.bundle.client_ids
+                if client_id not in self.malicious_clients
+            ]
+    
+            selected = (
+                rng.sample(malicious_pool, malicious_count)
+                + rng.sample(benign_pool, count - malicious_count)
+            )
+    
+            return sorted(
+                selected,
+                key=lambda x: self.client_order[x],
+            )
+    
         return sorted(
             rng.sample(self.bundle.client_ids, count),
             key=lambda x: self.client_order[x],
