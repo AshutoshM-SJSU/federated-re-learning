@@ -654,6 +654,84 @@ def _load_cifar10_audited_raw(args) -> Optional[DataBundle]:
         },
     )
 
+def _make_femnist_iid_partition(
+    labels: torch.Tensor,
+    num_clients: int,
+    seed: int,
+) -> dict[str, list[int]]:
+    """Create deterministic stratified IID-style FEMNIST clients."""
+
+    if num_clients <= 0:
+        raise ValueError("num_clients must be positive.")
+
+    labels_np = labels.detach().cpu().numpy()
+
+    rng = np.random.default_rng(seed)
+
+    client_ids = [
+        f"iid_client_{index:03d}"
+        for index in range(num_clients)
+    ]
+
+    partitions = {
+        client_id: []
+        for client_id in client_ids
+    }
+
+    for label in range(62):
+        label_indices = np.flatnonzero(
+            labels_np == label
+        )
+
+        rng.shuffle(label_indices)
+
+        # Rotate the starting client so leftover examples from each
+        # class do not always go to the first few clients.
+        start_client = int(
+            rng.integers(0, num_clients)
+        )
+
+        for position, sample_index in enumerate(
+            label_indices
+        ):
+            client_number = (
+                start_client + position
+            ) % num_clients
+
+            client_id = client_ids[client_number]
+
+            partitions[client_id].append(
+                int(sample_index)
+            )
+
+    # Shuffle within each simulated client as well.
+    for client_id in client_ids:
+        client_array = np.asarray(
+            partitions[client_id],
+            dtype=np.int64,
+        )
+
+        rng.shuffle(client_array)
+
+        partitions[client_id] = [
+            int(index)
+            for index in client_array
+        ]
+
+    empty_clients = [
+        client_id
+        for client_id, indices in partitions.items()
+        if not indices
+    ]
+
+    if empty_clients:
+        raise RuntimeError(
+            "IID FEMNIST partition produced empty clients: "
+            + ", ".join(empty_clients)
+        )
+
+    return partitions
+
 def _load_femnist_audited_raw(args) -> Optional[DataBundle]:
     """Load the audited natural-client FEMNIST SQLite dataset."""
 
@@ -673,10 +751,34 @@ def _load_femnist_audited_raw(args) -> Optional[DataBundle]:
     train_split = "all_train"
     test_split = "all_test"
 
-    num_clients = int(args.num_users or 3400)
-
+    num_clients = int(args.num_users or 100)
+    
     if num_clients <= 0:
         raise ValueError("--num-users must be positive.")
+    
+    iid_value = getattr(args, "iid", None)
+    
+    iid_mode = (
+        iid_value is not None
+        and str(iid_value).strip().lower()
+        in {"1", "true", "yes", "iid"}
+    )
+    
+    if iid_mode:
+        source_writer_count = int(
+            getattr(
+                args,
+                "femnist_source_writers",
+                100,
+            )
+        )
+    else:
+        source_writer_count = num_clients
+    
+    if source_writer_count <= 0:
+        raise ValueError(
+            "--femnist-source-writers must be positive."
+        )
 
     max_per_client = int(
         getattr(args, "max_samples_per_client", 0)
@@ -724,9 +826,9 @@ def _load_femnist_audited_raw(args) -> Optional[DataBundle]:
                 f"No FEMNIST clients found in split {train_split!r}."
             )
 
-        if num_clients > len(available_clients):
+        if source_writer_count > len(available_clients):
             raise ValueError(
-                f"Requested {num_clients} FEMNIST clients, "
+                f"Requested {source_writer_count} FEMNIST source writers, "
                 f"but only {len(available_clients)} are available."
             )
 
@@ -734,7 +836,9 @@ def _load_femnist_audited_raw(args) -> Optional[DataBundle]:
         rng = random.Random(int(args.data_seed))
         rng.shuffle(available_clients)
 
-        selected_clients = available_clients[:num_clients]
+        selected_clients = available_clients[
+            :source_writer_count
+        ]
 
         # ---------------------------------------------------------------
         # Training data
@@ -890,7 +994,30 @@ def _load_femnist_audited_raw(args) -> Optional[DataBundle]:
         dtype=torch.long,
     )
 
-    client_ids = list(client_indices.keys())
+    if iid_mode:
+        client_indices = _make_femnist_iid_partition(
+            labels=train_y,
+            num_clients=num_clients,
+            seed=int(args.data_seed),
+        )
+    
+        client_ids = list(
+            client_indices.keys()
+        )
+    
+        partition_name = "iid_stratified_simulated"
+    
+        print(
+            "FEMNIST IID repartition: "
+            f"{source_writer_count} source writers -> "
+            f"{num_clients} simulated clients"
+        )
+    else:
+        client_ids = list(
+            client_indices.keys()
+        )
+    
+        partition_name = "natural_client_id"
 
     # -------------------------------------------------------------------
     # Label sanity checks
@@ -1015,7 +1142,9 @@ def _load_femnist_audited_raw(args) -> Optional[DataBundle]:
             "num_channels": 1,
             "input_shape": (1, 28, 28),
             "num_clients": len(client_ids),
-            "partition": "natural_client_id",
+            "partition": partition_name,
+            "iid": iid_mode,
+            "source_writers": source_writer_count,
             "partition_seed": int(args.data_seed),
             "train_split": train_split,
             "test_split": test_split,
@@ -2208,6 +2337,15 @@ def parse_args():
     # Compatibility arguments for repository data adapters.
     parser.add_argument("--num-users", type=int)
     parser.add_argument("--iid", default=None)
+    parser.add_argument(
+        "--femnist-source-writers",
+        type=int,
+        default=100,
+        help=(
+            "Number of natural FEMNIST writers used to construct "
+            "the pooled dataset before IID repartitioning."
+        ),
+    )
     parser.add_argument("--alpha", type=float, default=0.5)
     parser.add_argument("--thre-labels", type=int, default=2)
     parser.add_argument("--num-classes", type=int)
