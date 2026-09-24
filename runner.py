@@ -700,13 +700,17 @@ def _load_femnist_audited_raw(args) -> Optional[DataBundle]:
         # Select natural writer clients from the official training split.
         rows = connection.execute(
             """
-            SELECT client_id
-            FROM client_metadata
-            WHERE split_name = ?
-              AND num_examples > 0
-            ORDER BY client_id
+            SELECT train.client_id
+            FROM client_metadata AS train
+            JOIN client_metadata AS test
+              ON train.client_id = test.client_id
+            WHERE train.split_name = ?
+              AND test.split_name = ?
+              AND train.num_examples > 0
+              AND test.num_examples > 0
+            ORDER BY train.client_id
             """,
-            (train_split,),
+            (train_split, test_split),
         ).fetchall()
 
         available_clients = [
@@ -799,15 +803,21 @@ def _load_femnist_audited_raw(args) -> Optional[DataBundle]:
         # Global evaluation data
         # ---------------------------------------------------------------
 
-        test_rows = connection.execute(
-            """
-            SELECT serialized_example_proto
-            FROM examples
-            WHERE split_name = ?
-            ORDER BY rowid
-            """,
-            (test_split,),
-        ).fetchall()
+        test_rows = []
+        
+        for client_id in selected_clients:
+            client_test_rows = connection.execute(
+                """
+                SELECT serialized_example_proto
+                FROM examples
+                WHERE split_name = ?
+                  AND client_id = ?
+                ORDER BY rowid
+                """,
+                (test_split, client_id),
+            ).fetchall()
+        
+            test_rows.extend(client_test_rows)
 
         if not test_rows:
             raise RuntimeError(
